@@ -6,6 +6,7 @@ import re
 import sqlite3
 import tempfile
 import zipfile
+import base64
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 try:
@@ -426,364 +427,156 @@ def build_reports_zip_24h() -> Optional[str]:
         ]
         for idx, (_rid, tid, student_name, username, filename, path, created_at, summary) in enumerate(existing, start=1):
             safe_student = safe_filename(student_name or f"student_{tid}")
-            archive_name = f"{idx:03d}_{created_at.replace(':', '-').replace(' ', '_')}_{safe_student}.pdf"
+            archive_name = f"{idx:03d}_{created_at.replace(':', '-').replace(' ', '_')}_{safe_student}{os.path.splitext(path)[1] or '.html'}"
             zf.write(path, archive_name)
             summary_lines.append(f"{idx}. {student_name} | @{username if username else 'no_username'} | ID {tid} | {created_at} | {summary} | {archive_name}")
         zf.writestr("reports_summary.txt", "\n".join(summary_lines))
     return zip_path
 
 
-# -------------------------- PDF --------------------------
+# -------------------------- HTML REPORT --------------------------
+# Alternative reporting method: send a clean HTML report file instead of generating a PDF/image.
+# Browsers render Arabic names correctly, so this avoids font/rendering problems on Railway.
 
-def _font_candidates(patterns: List[str]) -> List[str]:
-    found: List[str] = []
-    for pattern in patterns:
-        for path in glob.glob(pattern, recursive=True):
-            if os.path.exists(path) and path not in found:
-                found.append(path)
-    return found
-
-# The student PDF is generated as a high-resolution A4 image and then saved as PDF.
-# This avoids ReportLab Arabic rendering problems and guarantees that Arabic names
-# display correctly as long as an Arabic-capable TrueType font exists on the server.
-# Railway installs DejaVu fonts through nixpacks.toml.
-from PIL import Image as PILImage, ImageDraw, ImageFont, features
-
-A4_W, A4_H = 1240, 1754  # A4 portrait at ~150 DPI
-MARGIN = 64
-NAVY_HEX = "#0D1F44"
-BLUE_HEX = "#2F5DA8"
-SOFT_HEX = "#F5F7FC"
-ROW_HEX = "#EAF0F8"
-LINE_HEX = "#D8E0EE"
-TEXT_HEX = "#101827"
-MUTED_HEX = "#5C6475"
-WHITE_HEX = "#FFFFFF"
+HTML_NAVY = "#0D1F44"
+HTML_BLUE = "#2F5DA8"
+HTML_SOFT = "#F5F8FD"
+HTML_ROW = "#EAF0F8"
+HTML_LINE = "#D9E2F0"
+HTML_TEXT = "#111827"
+HTML_MUTED = "#5D6678"
 
 
-def _font_paths() -> dict:
-    """Find fonts without bundling font files inside the project."""
-    regular_patterns = [
-        os.path.join(os.path.dirname(__file__), "NotoNaskhArabic-Regular.ttf"),
-        os.path.join(os.path.dirname(__file__), "NotoSansArabic-Regular.ttf"),
-        os.path.join(os.path.dirname(__file__), "Amiri-Regular.ttf"),
-        "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
-        "/usr/share/fonts/truetype/liberation/LiberationSans-Regular.ttf",
-        "/usr/share/fonts/opentype/noto/NotoNaskhArabic-Regular.ttf",
-        "/usr/share/fonts/truetype/noto/NotoNaskhArabic-Regular.ttf",
-    ] + _font_candidates([
-        "/nix/store/**/DejaVuSans.ttf",
-        "/nix/store/**/NotoNaskhArabic-Regular.ttf",
-        "/nix/store/**/NotoSansArabic-Regular.ttf",
-        "/usr/share/fonts/**/DejaVuSans.ttf",
-        "/usr/share/fonts/**/NotoNaskhArabic-Regular.ttf",
-        "/usr/share/fonts/**/NotoSansArabic-Regular.ttf",
-    ])
-    bold_patterns = [
-        os.path.join(os.path.dirname(__file__), "NotoNaskhArabic-Bold.ttf"),
-        os.path.join(os.path.dirname(__file__), "NotoSansArabic-Bold.ttf"),
-        os.path.join(os.path.dirname(__file__), "Amiri-Bold.ttf"),
-        "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf",
-        "/usr/share/fonts/truetype/liberation/LiberationSans-Bold.ttf",
-        "/usr/share/fonts/opentype/noto/NotoNaskhArabic-Bold.ttf",
-        "/usr/share/fonts/truetype/noto/NotoNaskhArabic-Bold.ttf",
-    ] + _font_candidates([
-        "/nix/store/**/DejaVuSans-Bold.ttf",
-        "/nix/store/**/NotoNaskhArabic-Bold.ttf",
-        "/nix/store/**/NotoSansArabic-Bold.ttf",
-        "/usr/share/fonts/**/DejaVuSans-Bold.ttf",
-        "/usr/share/fonts/**/NotoNaskhArabic-Bold.ttf",
-        "/usr/share/fonts/**/NotoSansArabic-Bold.ttf",
-    ])
-    regular = next((x for x in regular_patterns if os.path.exists(x)), None)
-    bold = next((x for x in bold_patterns if os.path.exists(x)), regular)
-    return {"regular": regular, "bold": bold or regular}
-
-_FONT_PATHS = _font_paths()
-PIL_HAS_RAQM = bool(features.check("raqm"))
+def html_escape_text(value) -> str:
+    return escape(str(value or ""), quote=True)
 
 
-def font(size: int, bold: bool = False):
-    path = _FONT_PATHS.get("bold" if bold else "regular") or _FONT_PATHS.get("regular")
+def logo_data_uri() -> str:
+    if not os.path.exists(LOGO_PATH):
+        return ""
     try:
-        if path:
-            try:
-                return ImageFont.truetype(path, size=size, layout_engine=ImageFont.Layout.RAQM)
-            except Exception:
-                return ImageFont.truetype(path, size=size)
+        with open(LOGO_PATH, "rb") as f:
+            encoded = base64.b64encode(f.read()).decode("ascii")
+        return f"data:image/png;base64,{encoded}"
     except Exception:
-        pass
-    return ImageFont.load_default()
+        return ""
 
 
-def shape_text(text: str) -> str:
-    """Prepare text for the PDF image renderer.
-
-    Important: Pillow on Railway normally supports RAQM, which means it can render
-    Arabic directly. In that case we MUST NOT apply arabic_reshaper/get_display,
-    because double shaping makes Arabic names look reversed or corrupted.
-    The reshaper fallback is used only when RAQM is unavailable.
-    """
-    text = str(text or "")
-    if has_arabic(text) and (not PIL_HAS_RAQM) and arabic_reshaper and get_display:
-        try:
-            return get_display(arabic_reshaper.reshape(text))
-        except Exception:
-            return text
-    return text
-
-
-def text_bbox(draw: ImageDraw.ImageDraw, text: str, fnt) -> tuple:
-    try:
-        return draw.textbbox((0, 0), text, font=fnt)
-    except Exception:
-        w, h = draw.textsize(text, font=fnt)
-        return (0, 0, w, h)
-
-
-def text_width(draw: ImageDraw.ImageDraw, text: str, fnt) -> int:
-    b = text_bbox(draw, text, fnt)
-    return b[2] - b[0]
-
-
-def text_height(draw: ImageDraw.ImageDraw, text: str, fnt) -> int:
-    b = text_bbox(draw, text, fnt)
-    return b[3] - b[1]
-
-
-def draw_text(draw: ImageDraw.ImageDraw, xy, text: str, fnt, fill=TEXT_HEX, anchor=None, align="left"):
-    shaped = shape_text(text)
-    x, y = xy
-    if align == "right":
-        x -= text_width(draw, shaped, fnt)
-    elif align == "center":
-        x -= text_width(draw, shaped, fnt) // 2
-    draw.text((x, y), shaped, font=fnt, fill=fill, anchor=anchor)
-
-
-def fit_text(draw: ImageDraw.ImageDraw, text: str, max_width: int, size: int, bold: bool = True, min_size: int = 18):
-    current = size
-    while current >= min_size:
-        f = font(current, bold=bold)
-        if text_width(draw, shape_text(text), f) <= max_width:
-            return f
-        current -= 1
-    return font(min_size, bold=bold)
-
-
-def wrap_words(draw: ImageDraw.ImageDraw, text: str, fnt, max_width: int) -> List[str]:
-    text = str(text or "")
-    # Keep Arabic names on one line by shrinking them elsewhere; this wrapper is for English labels.
-    words = text.split()
-    if not words:
-        return [""]
-    lines = []
-    cur = words[0]
-    for word in words[1:]:
-        trial = cur + " " + word
-        if text_width(draw, trial, fnt) <= max_width:
-            cur = trial
-        else:
-            lines.append(cur)
-            cur = word
-    lines.append(cur)
-    return lines
-
-
-def draw_box(draw: ImageDraw.ImageDraw, box, outline=NAVY_HEX, fill=WHITE_HEX, width=2, radius=10):
-    try:
-        draw.rounded_rectangle(box, radius=radius, outline=outline, fill=fill, width=width)
-    except Exception:
-        draw.rectangle(box, outline=outline, fill=fill, width=width)
-
-
-def draw_label_value(draw: ImageDraw.ImageDraw, x: int, y: int, label_text: str, value_text: str, value_max_w: int):
-    label_f = font(28, bold=True)
-    value_f = fit_text(draw, value_text, value_max_w, 30, bold=True, min_size=18)
-    draw_text(draw, (x, y), label_text, label_f, fill=NAVY_HEX)
-    draw_text(draw, (x + 230, y), value_text, value_f, fill=TEXT_HEX)
-
-
-def draw_kv_cell(draw: ImageDraw.ImageDraw, box, label_text: str, value_text: str):
-    x0, y0, x1, y1 = box
-    label_f = font(26, bold=True)
-    # Reserve the left part for the label and the right part for the value.
-    label_x = x0 + 22
-    value_x0 = x0 + 220
-    value_x1 = x1 - 20
-    y = y0 + 18
-    draw_text(draw, (label_x, y), label_text, label_f, fill=NAVY_HEX)
-    max_w = max(90, value_x1 - value_x0)
-    value_f = fit_text(draw, value_text, max_w, 28, bold=True, min_size=16)
-    if has_arabic(str(value_text)):
-        # Arabic names are right-aligned inside their value cell so word order appears natural.
-        draw_text(draw, (value_x1, y), value_text, value_f, fill=TEXT_HEX, align="right")
-    else:
-        draw_text(draw, (value_x0, y), value_text, value_f, fill=TEXT_HEX)
-
-
-def draw_table_cell(draw: ImageDraw.ImageDraw, box, text: str, fnt, fill=TEXT_HEX, align="left", bold=False):
-    x0, y0, x1, y1 = box
-    pad = 12
-    max_w = (x1 - x0) - 2 * pad
-    shaped = shape_text(text)
-    # For ordinary text, shrink rather than overflow.
-    local_font = fnt
-    while text_width(draw, shaped, local_font) > max_w and getattr(local_font, 'size', 10) > 12:
-        local_font = font(local_font.size - 1, bold=bold)
-    h = text_height(draw, shaped, local_font)
-    y = y0 + ((y1 - y0 - h) // 2) - 2
-    if align == "center":
-        x = x0 + (x1 - x0) // 2
-        draw_text(draw, (x, y), text, local_font, fill=fill, align="center")
-    elif align == "right":
-        draw_text(draw, (x1 - pad, y), text, local_font, fill=fill, align="right")
-    else:
-        draw_text(draw, (x0 + pad, y), text, local_font, fill=fill)
-
-
-def draw_clean_pdf_image(student_name: str, answers: List[dict], result: dict, mode: str) -> PILImage.Image:
-    img = PILImage.new("RGB", (A4_W, A4_H), "white")
-    draw = ImageDraw.Draw(img)
-
-    # Background and border
-    draw.rectangle((0, 0, A4_W, A4_H), fill="#FCFDFF")
-    draw_box(draw, (36, 36, A4_W - 36, A4_H - 36), outline=NAVY_HEX, fill="#FCFDFF", width=3, radius=14)
-
-    # Header
-    header_x0, header_y0, header_x1, header_y1 = 64, 64, A4_W - 64, 260
-    draw_box(draw, (header_x0, header_y0, header_x1, header_y1), outline=LINE_HEX, fill=WHITE_HEX, width=2, radius=12)
-    draw.rectangle((header_x0, header_y1 - 7, header_x1, header_y1), fill=BLUE_HEX)
-
-    title_f = fit_text(draw, REPORT_TITLE, 780, 50, bold=True, min_size=36)
-    sub_f = font(26, bold=True)
-    draw_text(draw, (92, 90), REPORT_TITLE, title_f, fill=NAVY_HEX)
-    draw_text(draw, (92, 160), "Stage 1 Grade Report | Al-Kindy College of Medicine", sub_f, fill=NAVY_HEX)
-    draw_text(draw, (92, 200), f"Batch 27 | Developed by {DEVELOPER_NAME}", sub_f, fill=NAVY_HEX)
-
-    if os.path.exists(LOGO_PATH):
-        try:
-            logo = PILImage.open(LOGO_PATH).convert("RGBA")
-            logo.thumbnail((230, 155), PILImage.LANCZOS)
-            lx = header_x1 - 270
-            ly = header_y0 + 22
-            # White space behind the logo so colors never cover it.
-            draw.rounded_rectangle((lx - 10, ly - 10, lx + 250, ly + 160), radius=12, fill="white")
-            img.paste(logo, (lx, ly), logo)
-        except Exception:
-            pass
-
-    # Student info: privacy friendly, no Telegram username/id/name.
-    info_x0, info_y0, info_x1, info_y1 = 64, 290, A4_W - 64, 430
-    draw_box(draw, (info_x0, info_y0, info_x1, info_y1), outline=LINE_HEX, fill=WHITE_HEX, width=2, radius=10)
-    mid_x = info_x0 + (info_x1 - info_x0) // 2
-    mid_y = info_y0 + (info_y1 - info_y0) // 2
-    draw.line((mid_x, info_y0 + 14, mid_x, info_y1 - 14), fill=LINE_HEX, width=2)
-    draw.line((info_x0 + 14, mid_y, info_x1 - 14, mid_y), fill=LINE_HEX, width=2)
-
-    draw_kv_cell(draw, (info_x0, info_y0, mid_x, mid_y), "Student Name", student_name)
-    draw_kv_cell(draw, (mid_x, info_y0, info_x1, mid_y), "Report Date", iraq_now().strftime("%Y-%m-%d %H:%M") + " Iraq")
-    draw_kv_cell(draw, (info_x0, mid_y, mid_x, info_y1), "Stage", "First Year")
-    draw_kv_cell(draw, (mid_x, mid_y, info_x1, info_y1), "College", "Al-Kindy Medicine")
-
-    # Final result block
-    result_x0, result_y0, result_x1, result_y1 = 64, 460, A4_W - 64, 655
-    draw.rounded_rectangle((result_x0, result_y0, result_x1, result_y1), radius=12, fill=WHITE_HEX, outline=LINE_HEX, width=2)
-    draw.rounded_rectangle((result_x0, result_y0, result_x1, result_y0 + 58), radius=12, fill=SOFT_HEX, outline=None)
-    draw.rectangle((result_x0, result_y0 + 48, result_x1, result_y0 + 58), fill=SOFT_HEX)
-    draw_text(draw, (92, 474), "Final Result", font(30, bold=True), fill=NAVY_HEX)
-    if mode == "grades":
-        note = "Grade categories give a range. Stage 1 impact is shown as a percent of final cumulative grade."
-    else:
-        note = "Numeric scores were used, so the result is exact based on entered values."
-    draw_text(draw, (325, 482), note, fit_text(draw, note, 820, 22, bold=True, min_size=16), fill=MUTED_HEX)
-
-    # Result table fills full width of the result box
-    rt_x0, rt_y0 = result_x0, result_y0 + 58
-    rt_x1, rt_y1 = result_x1, result_y1
-    if mode == "grades":
-        headers = ["Metric", "Minimum", "Middle", "Maximum"]
-        rows = [
-            ["Stage average", f"{result['min_avg']:.2f}%", f"{result['avg_avg']:.2f}%", f"{result['max_avg']:.2f}%"],
-            ["Cumulative impact", f"{result['min_contribution']:.2f}%", f"{result['avg_contribution']:.2f}%", f"{result['max_contribution']:.2f}%"],
-        ]
-        widths = [430, 227, 227, 228]
-    else:
-        headers = ["Metric", "Value"]
-        rows = [["Stage average", f"{result['avg']:.2f}%"], ["Cumulative impact", f"{result['contribution']:.2f}%"]]
-        widths = [650, 462]
-    row_h = (rt_y1 - rt_y0) // (len(rows) + 1)
-    x = rt_x0
-    for ci, w in enumerate(widths):
-        draw.rectangle((x, rt_y0, x + w, rt_y0 + row_h), fill=NAVY_HEX, outline="white", width=2)
-        draw_table_cell(draw, (x, rt_y0, x + w, rt_y0 + row_h), headers[ci], font(22, bold=True), fill="white", align="center", bold=True)
-        x += w
-    for ri, row in enumerate(rows):
-        y0 = rt_y0 + row_h * (ri + 1)
-        x = rt_x0
-        for ci, w in enumerate(widths):
-            fill = "#EEF3FB" if ri % 2 == 0 else "#FFFFFF"
-            draw.rectangle((x, y0, x + w, y0 + row_h), fill=fill, outline="white", width=2)
-            draw_table_cell(draw, (x, y0, x + w, y0 + row_h), row[ci], font(23, bold=True), align="center" if ci else "left", bold=True)
-            x += w
-
-    # Main subject table: true full page width and stretched vertically.
-    table_x0, table_y0, table_x1, table_y1 = 64, 690, A4_W - 64, 1588
-    draw_box(draw, (table_x0, table_y0, table_x1, table_y1), outline=LINE_HEX, fill=WHITE_HEX, width=2, radius=10)
-    headers = ["Subject", "Cr", "Grade" if mode == "grades" else "Score", "Range" if mode == "grades" else "Impact", "Impact" if mode == "grades" else ""]
-    if mode == "grades":
-        col_widths = [445, 75, 185, 175, 232]  # total 1112 px = full table width
-    else:
-        col_widths = [585, 90, 190, 247]
-        headers = ["Subject", "Cr", "Score", "Impact"]
-    header_h = 52
-    body_h = table_y1 - table_y0 - header_h
-    row_h = body_h // len(answers)
-    # Header row
-    x = table_x0
-    for ci, w in enumerate(col_widths):
-        draw.rectangle((x, table_y0, x + w, table_y0 + header_h), fill=NAVY_HEX, outline="white", width=2)
-        draw_table_cell(draw, (x, table_y0, x + w, table_y0 + header_h), headers[ci], font(23, bold=True), fill="white", align="center" if ci else "left", bold=True)
-        x += w
-    # Rows
-    for ri, item in enumerate(answers):
-        y0 = table_y0 + header_h + ri * row_h
-        y1 = table_y0 + header_h + (ri + 1) * row_h if ri < len(answers) - 1 else table_y1
-        row_fill = "#FFFFFF" if ri % 2 == 0 else ROW_HEX
+def build_html_subject_rows(answers: List[dict], mode: str) -> str:
+    rows = []
+    for item in answers:
         if mode == "grades":
             cmin = item["min_score"] * item["credits"] / TOTAL_CREDITS * STAGE_WEIGHT_PERCENT / 100
             cmax = item["max_score"] * item["credits"] / TOTAL_CREDITS * STAGE_WEIGHT_PERCENT / 100
-            vals = [item["subject_en"], str(item["credits"]), item["grade_en"], f"{item['min_score']}-{item['max_score']}", f"{cmin:.2f}% - {cmax:.2f}%"]
+            values = [item["subject_en"], str(item["credits"]), item["grade_en"], f"{item['min_score']}-{item['max_score']}", f"{cmin:.2f}% - {cmax:.2f}%"]
         else:
             contrib = item["score"] * item["credits"] / TOTAL_CREDITS * STAGE_WEIGHT_PERCENT / 100
-            vals = [item["subject_en"], str(item["credits"]), f"{item['score']:.2f}", f"{contrib:.2f}%"]
-        x = table_x0
-        for ci, w in enumerate(col_widths):
-            draw.rectangle((x, y0, x + w, y1), fill=row_fill, outline="white", width=2)
-            cell_font = font(21 if ci == 0 else 20, bold=True)
-            draw_table_cell(draw, (x, y0, x + w, y1), vals[ci], cell_font, align="center" if ci else "left", bold=True)
-            x += w
-
-    # Footer note
-    footer_f = font(16, bold=True)
-    footer = "This report is automatically generated by KMC B27 Grade Calculator. It is not an official college transcript."
-    draw_text(draw, (A4_W // 2, 1625), footer, footer_f, fill=MUTED_HEX, align="center")
-    draw_text(draw, (A4_W // 2, 1662), f"Developed by {DEVELOPER_NAME} | Generated in Iraq time", footer_f, fill=NAVY_HEX, align="center")
-    return img
+            values = [item["subject_en"], str(item["credits"]), f"{item['score']:.2f}", f"{contrib:.2f}%"]
+        rows.append("<tr>" + "".join(f"<td>{html_escape_text(v)}</td>" for v in values) + "</tr>")
+    return "\n".join(rows)
 
 
-def create_pdf_report(student_name: str, answers: List[dict], result: dict, mode: str, update: Update) -> Tuple[str, str]:
+def create_html_report(student_name: str, answers: List[dict], result: dict, mode: str, update: Update) -> Tuple[str, str]:
     user = update.effective_user
     telegram_id = str(user.id) if user else "unknown"
-    send_filename = f"{safe_filename(student_name)}.pdf"
-    storage_filename = f"{safe_filename(student_name)}_{iraq_now().strftime('%Y%m%d_%H%M%S')}_{telegram_id}.pdf"
+    send_filename = f"{safe_filename(student_name)}.html"
+    storage_filename = f"{safe_filename(student_name)}_{iraq_now().strftime('%Y%m%d_%H%M%S')}_{telegram_id}.html"
     path = os.path.join(REPORTS_DIR, storage_filename)
 
-    image = draw_clean_pdf_image(student_name, answers, result, mode)
-    # Saving the rendered A4 image as PDF makes Arabic output reliable across PDF viewers.
-    image.save(path, "PDF", resolution=150.0)
+    report_date = iraq_now().strftime("%Y-%m-%d %H:%M Iraq")
+    logo_uri = logo_data_uri()
+    logo_html = f'<img class="logo" src="{logo_uri}" alt="Batch 27 Logo">' if logo_uri else ""
+
+    if mode == "grades":
+        result_cells = f"""
+        <tr><th>Metric</th><th>Minimum</th><th>Middle</th><th>Maximum</th></tr>
+        <tr><td>Stage average</td><td>{result['min_avg']:.2f}%</td><td>{result['avg_avg']:.2f}%</td><td>{result['max_avg']:.2f}%</td></tr>
+        <tr><td>Cumulative impact</td><td>{result['min_contribution']:.2f}%</td><td>{result['avg_contribution']:.2f}%</td><td>{result['max_contribution']:.2f}%</td></tr>
+        """
+        subject_headers = "<tr><th>Subject</th><th>Cr</th><th>Grade</th><th>Range</th><th>Impact</th></tr>"
+        note = "Grade categories give a range. Stage 1 impact is shown as percent of the final cumulative grade."
+    else:
+        result_cells = f"""
+        <tr><th>Metric</th><th>Result</th></tr>
+        <tr><td>Stage average</td><td>{result['avg']:.2f}%</td></tr>
+        <tr><td>Cumulative impact</td><td>{result['contribution']:.2f}%</td></tr>
+        """
+        subject_headers = "<tr><th>Subject</th><th>Cr</th><th>Score</th><th>Impact</th></tr>"
+        note = "Numeric scores were used. Stage 1 impact is shown as percent of the final cumulative grade."
+
+    rows_html = build_html_subject_rows(answers, mode)
+    student_name_html = html_escape_text(student_name)
+    result_cells = result_cells.strip()
+
+    html = f"""<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>KMC B27 Grade Report - {student_name_html}</title>
+<style>
+  :root {{ --navy:{HTML_NAVY}; --blue:{HTML_BLUE}; --soft:{HTML_SOFT}; --row:{HTML_ROW}; --line:{HTML_LINE}; --text:{HTML_TEXT}; --muted:{HTML_MUTED}; }}
+  * {{ box-sizing: border-box; }}
+  body {{ margin:0; background:#eef2f7; color:var(--text); font-family: Tahoma, Arial, "Noto Naskh Arabic", "Noto Sans Arabic", sans-serif; font-weight:700; }}
+  .page {{ width:210mm; min-height:297mm; margin:18px auto; background:white; border:2.5px solid var(--navy); border-radius:10px; padding:16mm 15mm 14mm; position:relative; page-break-after:always; }}
+  .header {{ border:1.7px solid var(--line); border-radius:12px; padding:18px 22px 16px; display:grid; grid-template-columns:1fr 150px; align-items:center; gap:18px; border-bottom:7px solid var(--blue); }}
+  h1 {{ margin:0; color:var(--navy); font-size:34px; letter-spacing:.5px; }}
+  .subtitle {{ margin-top:10px; color:var(--navy); font-size:18px; line-height:1.5; }}
+  .logo {{ max-width:148px; max-height:110px; object-fit:contain; justify-self:end; }}
+  .info {{ margin-top:20px; border:1.7px solid var(--line); border-radius:12px; overflow:hidden; display:grid; grid-template-columns:1fr 1fr; }}
+  .info div {{ padding:16px 18px; border-bottom:1px solid var(--line); }}
+  .info div:nth-child(odd) {{ border-right:1px solid var(--line); }}
+  .label {{ color:var(--muted); font-size:15px; display:block; margin-bottom:7px; }}
+  .value {{ color:var(--navy); font-size:20px; }}
+  .student-name {{ font-size:24px; direction:auto; unicode-bidi:plaintext; }}
+  .section-title {{ margin:28px 0 12px; color:var(--navy); font-size:28px; }}
+  .note {{ margin:0 0 12px; color:var(--muted); font-size:14px; }}
+  table {{ width:100%; border-collapse:collapse; table-layout:fixed; }}
+  th {{ background:var(--navy); color:white; padding:12px 10px; font-size:15px; text-align:center; }}
+  td {{ padding:11px 10px; border:1px solid white; font-size:15px; text-align:center; }}
+  td:first-child, th:first-child {{ text-align:left; }}
+  tbody tr:nth-child(even) td {{ background:var(--row); }}
+  tbody tr:nth-child(odd) td {{ background:#fbfdff; }}
+  .result-table td {{ font-size:18px; }}
+  .result-table td:first-child {{ color:var(--navy); }}
+  .big-card {{ margin-top:24px; background:var(--soft); border:1.7px solid var(--line); border-radius:14px; padding:20px 22px; font-size:17px; line-height:1.7; }}
+  .footer {{ position:absolute; left:15mm; right:15mm; bottom:9mm; color:var(--muted); font-size:12px; text-align:center; }}
+  .details-table th:nth-child(1) {{ width:42%; }} .details-table th:nth-child(2) {{ width:8%; }} .details-table th:nth-child(3) {{ width:18%; }} .details-table th:nth-child(4) {{ width:15%; }} .details-table th:nth-child(5) {{ width:17%; }}
+  .details-table td {{ font-size:14px; padding:9px 8px; }}
+  .print-button {{ position:fixed; right:18px; bottom:18px; background:var(--navy); color:white; padding:12px 16px; border-radius:999px; text-decoration:none; font:700 14px Arial; box-shadow:0 6px 22px rgba(0,0,0,.20); }}
+  @media print {{ body {{ background:white; }} .page {{ margin:0; border-radius:0; box-shadow:none; }} .print-button {{ display:none; }} }}
+  @page {{ size:A4; margin:0; }}
+</style>
+</head>
+<body>
+<a class="print-button" href="javascript:window.print()">Print / Save PDF</a>
+<section class="page">
+  <div class="header"><div><h1>KMC B27 GRADE CALCULATOR</h1><div class="subtitle">Stage 1 Grade Report | Al-Kindy College of Medicine<br>Batch 27 | Developed by Osama</div></div>{logo_html}</div>
+  <div class="info">
+    <div><span class="label">Student Name</span><span class="value student-name"><bdi dir="auto">{student_name_html}</bdi></span></div>
+    <div><span class="label">Report Date</span><span class="value">{report_date}</span></div>
+    <div><span class="label">Stage</span><span class="value">First Year</span></div>
+    <div><span class="label">College</span><span class="value">Al-Kindy Medicine</span></div>
+  </div>
+  <h2 class="section-title">Final Result</h2>
+  <p class="note">{html_escape_text(note)}</p>
+  <table class="result-table"><tbody>{result_cells}</tbody></table>
+  <div class="big-card"><strong>Important note:</strong><br>Cumulative impact is displayed as a percentage of the final cumulative grade, not as a division by 5.</div>
+  <div class="footer">This report is automatically generated and is not an official college transcript.<br>Developed by Osama | Iraq time | Page 1</div>
+</section>
+<section class="page">
+  <div class="header"><div><h1>Subject Details</h1><div class="subtitle">Credits-based calculation for the 15 Stage 1 subjects.</div></div>{logo_html}</div>
+  <h2 class="section-title">Detailed Calculation</h2>
+  <table class="details-table"><thead>{subject_headers}</thead><tbody>{rows_html}</tbody></table>
+  <div class="footer">Developed by Osama | Iraq time | Page 2</div>
+</section>
+</body>
+</html>"""
+    with open(path, "w", encoding="utf-8") as f:
+        f.write(html)
     return path, send_filename
 
+# -------------------------- Telegram handlers --------------------------
 # -------------------------- Telegram handlers --------------------------
 
 async def post_init(application: Application) -> None:
@@ -825,7 +618,7 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> in
         "معدل المرحلة = مجموع (درجة المادة × الكردت) ÷ 36\n"
         "مساهمة المرحلة بالتراكمي النهائي = معدل المرحلة × 0.05\n"
         "وتظهر كنسبة من الدرجة النهائية الكلية، مثال: 4.25% وليس 4.25/5.\n\n"
-        "<b>بعد إكمال الحساب، يرسل البوت تقرير PDF باسم الطالب.</b>"
+        "<b>بعد إكمال الحساب، يرسل البوت تقرير HTML باسم الطالب.</b>"
     )
     await update.effective_message.reply_text(text, parse_mode=ParseMode.HTML, reply_markup=main_keyboard_for(update))
     return MAIN
@@ -880,7 +673,7 @@ async def begin_calculation(update: Update, context: ContextTypes.DEFAULT_TYPE) 
     clear_calc(context)
     if not context.user_data.get("student_name"):
         await update.effective_message.reply_text(
-            "<b>قبل الحساب، يجب إضافة اسم الطالب الثلاثي حتى يظهر داخل تقرير PDF.</b>",
+            "<b>قبل الحساب، يجب إضافة اسم الطالب الثلاثي حتى يظهر داخل تقرير HTML.</b>",
             parse_mode=ParseMode.HTML,
             reply_markup=ReplyKeyboardRemove(),
         )
@@ -1012,14 +805,14 @@ def build_summary_text(result: dict, mode: str) -> str:
             f"<b>المعدل الوسطي التقريبي:</b> {result['avg_avg']:.2f}%\n"
             f"<b>مساهمة المرحلة الأولى في التراكمي النهائي:</b> {result['min_contribution']:.2f}% - {result['max_contribution']:.2f}%\n"
             "<b>ملاحظة:</b> هذه النسبة من الدرجة النهائية الكلية، وليست قسمة على 5.\n\n"
-            "<b>تم إرسال تقرير PDF باسمك.</b>"
+            "<b>تم إرسال تقرير HTML باسمك.</b>"
         )
     return (
         "<b>✅ تم حساب نتيجتك حسب الدرجات الرقمية</b>\n\n"
         f"<b>معدل المرحلة الأولى:</b> {result['avg']:.2f}%\n"
         f"<b>مساهمة المرحلة الأولى في التراكمي النهائي:</b> {result['contribution']:.2f}%\n"
         "<b>ملاحظة:</b> هذه النسبة من الدرجة النهائية الكلية، وليست قسمة على 5.\n\n"
-        "<b>تم إرسال تقرير PDF باسمك.</b>"
+        "<b>تم إرسال تقرير HTML باسمك.</b>"
     )
 
 
@@ -1028,14 +821,14 @@ async def finish_calculation(update: Update, context: ContextTypes.DEFAULT_TYPE)
     mode = context.user_data["mode"]
     student_name = context.user_data.get("student_name", "student")
     result = calculate_result(answers, mode)
-    pdf_path, send_filename = create_pdf_report(student_name, answers, result, mode, update)
+    report_path, send_filename = create_html_report(student_name, answers, result, mode, update)
     increment_calculation(update)
-    record_report(update, student_name, pdf_path, send_filename, mode, result)
+    record_report(update, student_name, report_path, send_filename, mode, result)
 
     summary = build_summary_text(result, mode)
     await update.message.reply_text(summary, parse_mode=ParseMode.HTML, reply_markup=main_keyboard_for(update))
-    with open(pdf_path, "rb") as f:
-        await update.message.reply_document(document=f, filename=send_filename, caption="<b>تقريرك بصيغة PDF ✅</b>", parse_mode=ParseMode.HTML)
+    with open(report_path, "rb") as f:
+        await update.message.reply_document(document=f, filename=send_filename, caption="<b>تقريرك جاهز كملف HTML ✅</b>\nافتح الملف من الهاتف. إذا أردته PDF اضغط Print / Save PDF داخل الملف.", parse_mode=ParseMode.HTML)
     clear_calc(context)
     return MAIN
 
@@ -1087,8 +880,8 @@ async def admin_stats(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int
         f"<b>نشطون آخر 24 ساعة:</b> {s['active_24h']}\n"
         f"<b>نشطون آخر 7 أيام:</b> {s['active_7d']}\n"
         f"<b>عدد عمليات الحساب:</b> {s['total_calcs']}\n"
-        f"<b>إجمالي ملفات PDF:</b> {s['reports_total']}\n"
-        f"<b>ملفات PDF آخر 24 ساعة:</b> {s['reports_24h']}\n\n"
+        f"<b>إجمالي التقارير:</b> {s['reports_total']}\n"
+        f"<b>تقارير آخر 24 ساعة:</b> {s['reports_24h']}\n\n"
         "<b>حالة الوصول بعد آخر فحص:</b>\n"
         f"• قابلون للوصول: <b>{s['reachable']}</b>\n"
         f"• حاذفون/حاظرون البوت: <b>{s['blocked']}</b>\n"
@@ -1119,10 +912,10 @@ async def admin_reports_24h(update: Update, context: ContextTypes.DEFAULT_TYPE) 
         return MAIN
     zip_path = build_reports_zip_24h()
     if not zip_path:
-        await update.message.reply_text("<b>لا توجد ملفات PDF محفوظة خلال آخر 24 ساعة.</b>", parse_mode=ParseMode.HTML, reply_markup=ADMIN_KEYBOARD)
+        await update.message.reply_text("<b>لا توجد تقارير محفوظة خلال آخر 24 ساعة.</b>", parse_mode=ParseMode.HTML, reply_markup=ADMIN_KEYBOARD)
         return MAIN
     with open(zip_path, "rb") as f:
-        await update.message.reply_document(document=f, filename=os.path.basename(zip_path), caption="<b>ملفات PDF المرسلة خلال آخر 24 ساعة.</b>", parse_mode=ParseMode.HTML)
+        await update.message.reply_document(document=f, filename=os.path.basename(zip_path), caption="<b>التقارير المرسلة خلال آخر 24 ساعة.</b>", parse_mode=ParseMode.HTML)
     try:
         os.remove(zip_path)
     except OSError:
