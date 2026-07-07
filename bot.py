@@ -436,7 +436,6 @@ def build_reports_zip_24h() -> Optional[str]:
 # -------------------------- PDF --------------------------
 
 def _font_candidates(patterns: List[str]) -> List[str]:
-    """Return existing font paths. This also supports Railway/Nix paths."""
     found: List[str] = []
     for pattern in patterns:
         for path in glob.glob(pattern, recursive=True):
@@ -444,224 +443,345 @@ def _font_candidates(patterns: List[str]) -> List[str]:
                 found.append(path)
     return found
 
+# The student PDF is generated as a high-resolution A4 image and then saved as PDF.
+# This avoids ReportLab Arabic rendering problems and guarantees that Arabic names
+# display correctly as long as an Arabic-capable TrueType font exists on the server.
+# Railway installs DejaVu fonts through nixpacks.toml.
+from PIL import Image as PILImage, ImageDraw, ImageFont, features
 
-def register_fonts() -> Tuple[str, str]:
-    # We do NOT include font files inside the project. On Railway, nixpacks.toml installs DejaVu fonts.
-    # The scan below finds them in /usr/share or /nix/store and registers them for Arabic names.
-    regular_candidates = [
+A4_W, A4_H = 1240, 1754  # A4 portrait at ~150 DPI
+MARGIN = 64
+NAVY_HEX = "#0D1F44"
+BLUE_HEX = "#2F5DA8"
+SOFT_HEX = "#F5F7FC"
+ROW_HEX = "#EAF0F8"
+LINE_HEX = "#D8E0EE"
+TEXT_HEX = "#101827"
+MUTED_HEX = "#5C6475"
+WHITE_HEX = "#FFFFFF"
+
+
+def _font_paths() -> dict:
+    """Find fonts without bundling font files inside the project."""
+    regular_patterns = [
         os.path.join(os.path.dirname(__file__), "NotoNaskhArabic-Regular.ttf"),
         os.path.join(os.path.dirname(__file__), "NotoSansArabic-Regular.ttf"),
         os.path.join(os.path.dirname(__file__), "Amiri-Regular.ttf"),
         "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
         "/usr/share/fonts/truetype/liberation/LiberationSans-Regular.ttf",
+        "/usr/share/fonts/opentype/noto/NotoNaskhArabic-Regular.ttf",
+        "/usr/share/fonts/truetype/noto/NotoNaskhArabic-Regular.ttf",
     ] + _font_candidates([
         "/nix/store/**/DejaVuSans.ttf",
         "/nix/store/**/NotoNaskhArabic-Regular.ttf",
         "/nix/store/**/NotoSansArabic-Regular.ttf",
+        "/usr/share/fonts/**/DejaVuSans.ttf",
         "/usr/share/fonts/**/NotoNaskhArabic-Regular.ttf",
         "/usr/share/fonts/**/NotoSansArabic-Regular.ttf",
     ])
-    bold_candidates = [
+    bold_patterns = [
         os.path.join(os.path.dirname(__file__), "NotoNaskhArabic-Bold.ttf"),
         os.path.join(os.path.dirname(__file__), "NotoSansArabic-Bold.ttf"),
         os.path.join(os.path.dirname(__file__), "Amiri-Bold.ttf"),
         "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf",
         "/usr/share/fonts/truetype/liberation/LiberationSans-Bold.ttf",
+        "/usr/share/fonts/opentype/noto/NotoNaskhArabic-Bold.ttf",
+        "/usr/share/fonts/truetype/noto/NotoNaskhArabic-Bold.ttf",
     ] + _font_candidates([
         "/nix/store/**/DejaVuSans-Bold.ttf",
         "/nix/store/**/NotoNaskhArabic-Bold.ttf",
         "/nix/store/**/NotoSansArabic-Bold.ttf",
+        "/usr/share/fonts/**/DejaVuSans-Bold.ttf",
         "/usr/share/fonts/**/NotoNaskhArabic-Bold.ttf",
         "/usr/share/fonts/**/NotoSansArabic-Bold.ttf",
     ])
-    regular_font = "Helvetica"
-    bold_font = "Helvetica-Bold"
-    for path in regular_candidates:
-        if os.path.exists(path):
+    regular = next((x for x in regular_patterns if os.path.exists(x)), None)
+    bold = next((x for x in bold_patterns if os.path.exists(x)), regular)
+    return {"regular": regular, "bold": bold or regular}
+
+_FONT_PATHS = _font_paths()
+PIL_HAS_RAQM = bool(features.check("raqm"))
+
+
+def font(size: int, bold: bool = False):
+    path = _FONT_PATHS.get("bold" if bold else "regular") or _FONT_PATHS.get("regular")
+    try:
+        if path:
             try:
-                pdfmetrics.registerFont(TTFont("BotFont", path))
-                regular_font = "BotFont"
-                break
+                return ImageFont.truetype(path, size=size, layout_engine=ImageFont.Layout.RAQM)
             except Exception:
-                continue
-    for path in bold_candidates:
-        if os.path.exists(path):
-            try:
-                pdfmetrics.registerFont(TTFont("BotFontBold", path))
-                bold_font = "BotFontBold"
-                break
-            except Exception:
-                continue
-    return regular_font, bold_font
-
-PDF_FONT, PDF_FONT_BOLD = register_fonts()
+                return ImageFont.truetype(path, size=size)
+    except Exception:
+        pass
+    return ImageFont.load_default()
 
 
-def p(text: str, style: ParagraphStyle) -> Paragraph:
-    return Paragraph(pdf_text(text), style)
+def shape_text(text: str) -> str:
+    """Prepare text for the PDF image renderer.
+
+    Important: Pillow on Railway normally supports RAQM, which means it can render
+    Arabic directly. In that case we MUST NOT apply arabic_reshaper/get_display,
+    because double shaping makes Arabic names look reversed or corrupted.
+    The reshaper fallback is used only when RAQM is unavailable.
+    """
+    text = str(text or "")
+    if has_arabic(text) and (not PIL_HAS_RAQM) and arabic_reshaper and get_display:
+        try:
+            return get_display(arabic_reshaper.reshape(text))
+        except Exception:
+            return text
+    return text
 
 
-def page_background(canvas, doc):
-    width, height = A4
-    navy = colors.HexColor("#0D1F44")
-    pale = colors.HexColor("#FAFBFE")
-    canvas.saveState()
-    canvas.setFillColor(pale)
-    canvas.rect(0, 0, width, height, fill=1, stroke=0)
-    canvas.setStrokeColor(navy)
-    canvas.setLineWidth(1.0)
-    canvas.roundRect(0.55 * cm, 0.55 * cm, width - 1.1 * cm, height - 1.1 * cm, 8, fill=0, stroke=1)
-    canvas.setFont(PDF_FONT_BOLD, 7)
-    canvas.setFillColor(colors.HexColor("#3A3A3A"))
-    canvas.drawString(1.0 * cm, 0.42 * cm, f"KMC B27 Grade Calculator | Developed by {DEVELOPER_NAME}")
-    canvas.restoreState()
+def text_bbox(draw: ImageDraw.ImageDraw, text: str, fnt) -> tuple:
+    try:
+        return draw.textbbox((0, 0), text, font=fnt)
+    except Exception:
+        w, h = draw.textsize(text, font=fnt)
+        return (0, 0, w, h)
+
+
+def text_width(draw: ImageDraw.ImageDraw, text: str, fnt) -> int:
+    b = text_bbox(draw, text, fnt)
+    return b[2] - b[0]
+
+
+def text_height(draw: ImageDraw.ImageDraw, text: str, fnt) -> int:
+    b = text_bbox(draw, text, fnt)
+    return b[3] - b[1]
+
+
+def draw_text(draw: ImageDraw.ImageDraw, xy, text: str, fnt, fill=TEXT_HEX, anchor=None, align="left"):
+    shaped = shape_text(text)
+    x, y = xy
+    if align == "right":
+        x -= text_width(draw, shaped, fnt)
+    elif align == "center":
+        x -= text_width(draw, shaped, fnt) // 2
+    draw.text((x, y), shaped, font=fnt, fill=fill, anchor=anchor)
+
+
+def fit_text(draw: ImageDraw.ImageDraw, text: str, max_width: int, size: int, bold: bool = True, min_size: int = 18):
+    current = size
+    while current >= min_size:
+        f = font(current, bold=bold)
+        if text_width(draw, shape_text(text), f) <= max_width:
+            return f
+        current -= 1
+    return font(min_size, bold=bold)
+
+
+def wrap_words(draw: ImageDraw.ImageDraw, text: str, fnt, max_width: int) -> List[str]:
+    text = str(text or "")
+    # Keep Arabic names on one line by shrinking them elsewhere; this wrapper is for English labels.
+    words = text.split()
+    if not words:
+        return [""]
+    lines = []
+    cur = words[0]
+    for word in words[1:]:
+        trial = cur + " " + word
+        if text_width(draw, trial, fnt) <= max_width:
+            cur = trial
+        else:
+            lines.append(cur)
+            cur = word
+    lines.append(cur)
+    return lines
+
+
+def draw_box(draw: ImageDraw.ImageDraw, box, outline=NAVY_HEX, fill=WHITE_HEX, width=2, radius=10):
+    try:
+        draw.rounded_rectangle(box, radius=radius, outline=outline, fill=fill, width=width)
+    except Exception:
+        draw.rectangle(box, outline=outline, fill=fill, width=width)
+
+
+def draw_label_value(draw: ImageDraw.ImageDraw, x: int, y: int, label_text: str, value_text: str, value_max_w: int):
+    label_f = font(28, bold=True)
+    value_f = fit_text(draw, value_text, value_max_w, 30, bold=True, min_size=18)
+    draw_text(draw, (x, y), label_text, label_f, fill=NAVY_HEX)
+    draw_text(draw, (x + 230, y), value_text, value_f, fill=TEXT_HEX)
+
+
+def draw_kv_cell(draw: ImageDraw.ImageDraw, box, label_text: str, value_text: str):
+    x0, y0, x1, y1 = box
+    label_f = font(26, bold=True)
+    # Reserve the left part for the label and the right part for the value.
+    label_x = x0 + 22
+    value_x0 = x0 + 220
+    value_x1 = x1 - 20
+    y = y0 + 18
+    draw_text(draw, (label_x, y), label_text, label_f, fill=NAVY_HEX)
+    max_w = max(90, value_x1 - value_x0)
+    value_f = fit_text(draw, value_text, max_w, 28, bold=True, min_size=16)
+    if has_arabic(str(value_text)):
+        # Arabic names are right-aligned inside their value cell so word order appears natural.
+        draw_text(draw, (value_x1, y), value_text, value_f, fill=TEXT_HEX, align="right")
+    else:
+        draw_text(draw, (value_x0, y), value_text, value_f, fill=TEXT_HEX)
+
+
+def draw_table_cell(draw: ImageDraw.ImageDraw, box, text: str, fnt, fill=TEXT_HEX, align="left", bold=False):
+    x0, y0, x1, y1 = box
+    pad = 12
+    max_w = (x1 - x0) - 2 * pad
+    shaped = shape_text(text)
+    # For ordinary text, shrink rather than overflow.
+    local_font = fnt
+    while text_width(draw, shaped, local_font) > max_w and getattr(local_font, 'size', 10) > 12:
+        local_font = font(local_font.size - 1, bold=bold)
+    h = text_height(draw, shaped, local_font)
+    y = y0 + ((y1 - y0 - h) // 2) - 2
+    if align == "center":
+        x = x0 + (x1 - x0) // 2
+        draw_text(draw, (x, y), text, local_font, fill=fill, align="center")
+    elif align == "right":
+        draw_text(draw, (x1 - pad, y), text, local_font, fill=fill, align="right")
+    else:
+        draw_text(draw, (x0 + pad, y), text, local_font, fill=fill)
+
+
+def draw_clean_pdf_image(student_name: str, answers: List[dict], result: dict, mode: str) -> PILImage.Image:
+    img = PILImage.new("RGB", (A4_W, A4_H), "white")
+    draw = ImageDraw.Draw(img)
+
+    # Background and border
+    draw.rectangle((0, 0, A4_W, A4_H), fill="#FCFDFF")
+    draw_box(draw, (36, 36, A4_W - 36, A4_H - 36), outline=NAVY_HEX, fill="#FCFDFF", width=3, radius=14)
+
+    # Header
+    header_x0, header_y0, header_x1, header_y1 = 64, 64, A4_W - 64, 260
+    draw_box(draw, (header_x0, header_y0, header_x1, header_y1), outline=LINE_HEX, fill=WHITE_HEX, width=2, radius=12)
+    draw.rectangle((header_x0, header_y1 - 7, header_x1, header_y1), fill=BLUE_HEX)
+
+    title_f = fit_text(draw, REPORT_TITLE, 780, 50, bold=True, min_size=36)
+    sub_f = font(26, bold=True)
+    draw_text(draw, (92, 90), REPORT_TITLE, title_f, fill=NAVY_HEX)
+    draw_text(draw, (92, 160), "Stage 1 Grade Report | Al-Kindy College of Medicine", sub_f, fill=NAVY_HEX)
+    draw_text(draw, (92, 200), f"Batch 27 | Developed by {DEVELOPER_NAME}", sub_f, fill=NAVY_HEX)
+
+    if os.path.exists(LOGO_PATH):
+        try:
+            logo = PILImage.open(LOGO_PATH).convert("RGBA")
+            logo.thumbnail((230, 155), PILImage.LANCZOS)
+            lx = header_x1 - 270
+            ly = header_y0 + 22
+            # White space behind the logo so colors never cover it.
+            draw.rounded_rectangle((lx - 10, ly - 10, lx + 250, ly + 160), radius=12, fill="white")
+            img.paste(logo, (lx, ly), logo)
+        except Exception:
+            pass
+
+    # Student info: privacy friendly, no Telegram username/id/name.
+    info_x0, info_y0, info_x1, info_y1 = 64, 290, A4_W - 64, 430
+    draw_box(draw, (info_x0, info_y0, info_x1, info_y1), outline=LINE_HEX, fill=WHITE_HEX, width=2, radius=10)
+    mid_x = info_x0 + (info_x1 - info_x0) // 2
+    mid_y = info_y0 + (info_y1 - info_y0) // 2
+    draw.line((mid_x, info_y0 + 14, mid_x, info_y1 - 14), fill=LINE_HEX, width=2)
+    draw.line((info_x0 + 14, mid_y, info_x1 - 14, mid_y), fill=LINE_HEX, width=2)
+
+    draw_kv_cell(draw, (info_x0, info_y0, mid_x, mid_y), "Student Name", student_name)
+    draw_kv_cell(draw, (mid_x, info_y0, info_x1, mid_y), "Report Date", iraq_now().strftime("%Y-%m-%d %H:%M") + " Iraq")
+    draw_kv_cell(draw, (info_x0, mid_y, mid_x, info_y1), "Stage", "First Year")
+    draw_kv_cell(draw, (mid_x, mid_y, info_x1, info_y1), "College", "Al-Kindy Medicine")
+
+    # Final result block
+    result_x0, result_y0, result_x1, result_y1 = 64, 460, A4_W - 64, 655
+    draw.rounded_rectangle((result_x0, result_y0, result_x1, result_y1), radius=12, fill=WHITE_HEX, outline=LINE_HEX, width=2)
+    draw.rounded_rectangle((result_x0, result_y0, result_x1, result_y0 + 58), radius=12, fill=SOFT_HEX, outline=None)
+    draw.rectangle((result_x0, result_y0 + 48, result_x1, result_y0 + 58), fill=SOFT_HEX)
+    draw_text(draw, (92, 474), "Final Result", font(30, bold=True), fill=NAVY_HEX)
+    if mode == "grades":
+        note = "Grade categories give a range. Stage 1 impact is shown as a percent of final cumulative grade."
+    else:
+        note = "Numeric scores were used, so the result is exact based on entered values."
+    draw_text(draw, (325, 482), note, fit_text(draw, note, 820, 22, bold=True, min_size=16), fill=MUTED_HEX)
+
+    # Result table fills full width of the result box
+    rt_x0, rt_y0 = result_x0, result_y0 + 58
+    rt_x1, rt_y1 = result_x1, result_y1
+    if mode == "grades":
+        headers = ["Metric", "Minimum", "Middle", "Maximum"]
+        rows = [
+            ["Stage average", f"{result['min_avg']:.2f}%", f"{result['avg_avg']:.2f}%", f"{result['max_avg']:.2f}%"],
+            ["Cumulative impact", f"{result['min_contribution']:.2f}%", f"{result['avg_contribution']:.2f}%", f"{result['max_contribution']:.2f}%"],
+        ]
+        widths = [430, 227, 227, 228]
+    else:
+        headers = ["Metric", "Value"]
+        rows = [["Stage average", f"{result['avg']:.2f}%"], ["Cumulative impact", f"{result['contribution']:.2f}%"]]
+        widths = [650, 462]
+    row_h = (rt_y1 - rt_y0) // (len(rows) + 1)
+    x = rt_x0
+    for ci, w in enumerate(widths):
+        draw.rectangle((x, rt_y0, x + w, rt_y0 + row_h), fill=NAVY_HEX, outline="white", width=2)
+        draw_table_cell(draw, (x, rt_y0, x + w, rt_y0 + row_h), headers[ci], font(22, bold=True), fill="white", align="center", bold=True)
+        x += w
+    for ri, row in enumerate(rows):
+        y0 = rt_y0 + row_h * (ri + 1)
+        x = rt_x0
+        for ci, w in enumerate(widths):
+            fill = "#EEF3FB" if ri % 2 == 0 else "#FFFFFF"
+            draw.rectangle((x, y0, x + w, y0 + row_h), fill=fill, outline="white", width=2)
+            draw_table_cell(draw, (x, y0, x + w, y0 + row_h), row[ci], font(23, bold=True), align="center" if ci else "left", bold=True)
+            x += w
+
+    # Main subject table: true full page width and stretched vertically.
+    table_x0, table_y0, table_x1, table_y1 = 64, 690, A4_W - 64, 1588
+    draw_box(draw, (table_x0, table_y0, table_x1, table_y1), outline=LINE_HEX, fill=WHITE_HEX, width=2, radius=10)
+    headers = ["Subject", "Cr", "Grade" if mode == "grades" else "Score", "Range" if mode == "grades" else "Impact", "Impact" if mode == "grades" else ""]
+    if mode == "grades":
+        col_widths = [445, 75, 185, 175, 232]  # total 1112 px = full table width
+    else:
+        col_widths = [585, 90, 190, 247]
+        headers = ["Subject", "Cr", "Score", "Impact"]
+    header_h = 52
+    body_h = table_y1 - table_y0 - header_h
+    row_h = body_h // len(answers)
+    # Header row
+    x = table_x0
+    for ci, w in enumerate(col_widths):
+        draw.rectangle((x, table_y0, x + w, table_y0 + header_h), fill=NAVY_HEX, outline="white", width=2)
+        draw_table_cell(draw, (x, table_y0, x + w, table_y0 + header_h), headers[ci], font(23, bold=True), fill="white", align="center" if ci else "left", bold=True)
+        x += w
+    # Rows
+    for ri, item in enumerate(answers):
+        y0 = table_y0 + header_h + ri * row_h
+        y1 = table_y0 + header_h + (ri + 1) * row_h if ri < len(answers) - 1 else table_y1
+        row_fill = "#FFFFFF" if ri % 2 == 0 else ROW_HEX
+        if mode == "grades":
+            cmin = item["min_score"] * item["credits"] / TOTAL_CREDITS * STAGE_WEIGHT_PERCENT / 100
+            cmax = item["max_score"] * item["credits"] / TOTAL_CREDITS * STAGE_WEIGHT_PERCENT / 100
+            vals = [item["subject_en"], str(item["credits"]), item["grade_en"], f"{item['min_score']}-{item['max_score']}", f"{cmin:.2f}% - {cmax:.2f}%"]
+        else:
+            contrib = item["score"] * item["credits"] / TOTAL_CREDITS * STAGE_WEIGHT_PERCENT / 100
+            vals = [item["subject_en"], str(item["credits"]), f"{item['score']:.2f}", f"{contrib:.2f}%"]
+        x = table_x0
+        for ci, w in enumerate(col_widths):
+            draw.rectangle((x, y0, x + w, y1), fill=row_fill, outline="white", width=2)
+            cell_font = font(21 if ci == 0 else 20, bold=True)
+            draw_table_cell(draw, (x, y0, x + w, y1), vals[ci], cell_font, align="center" if ci else "left", bold=True)
+            x += w
+
+    # Footer note
+    footer_f = font(16, bold=True)
+    footer = "This report is automatically generated by KMC B27 Grade Calculator. It is not an official college transcript."
+    draw_text(draw, (A4_W // 2, 1625), footer, footer_f, fill=MUTED_HEX, align="center")
+    draw_text(draw, (A4_W // 2, 1662), f"Developed by {DEVELOPER_NAME} | Generated in Iraq time", footer_f, fill=NAVY_HEX, align="center")
+    return img
 
 
 def create_pdf_report(student_name: str, answers: List[dict], result: dict, mode: str, update: Update) -> Tuple[str, str]:
     user = update.effective_user
-    telegram_id = str(user.id) if user else "Unknown"
+    telegram_id = str(user.id) if user else "unknown"
     send_filename = f"{safe_filename(student_name)}.pdf"
     storage_filename = f"{safe_filename(student_name)}_{iraq_now().strftime('%Y%m%d_%H%M%S')}_{telegram_id}.pdf"
     path = os.path.join(REPORTS_DIR, storage_filename)
 
-    doc = SimpleDocTemplate(
-        path,
-        pagesize=A4,
-        rightMargin=1.15 * cm,
-        leftMargin=1.15 * cm,
-        topMargin=0.85 * cm,
-        bottomMargin=0.85 * cm,
-    )
-
-    styles = getSampleStyleSheet()
-    navy = colors.HexColor("#0D1F44")
-    accent = colors.HexColor("#2F5DA8")
-    soft = colors.HexColor("#F3F6FB")
-    line = colors.HexColor("#D5DDEB")
-    row_alt = colors.HexColor("#EAF0F8")
-
-    title_style = ParagraphStyle("TitleBot", parent=styles["Title"], fontName=PDF_FONT_BOLD, fontSize=21, leading=24, textColor=navy, alignment=0)
-    subtitle_style = ParagraphStyle("SubtitleBot", parent=styles["Normal"], fontName=PDF_FONT_BOLD, fontSize=10.5, leading=13, textColor=navy)
-    normal = ParagraphStyle("NormalBot", parent=styles["Normal"], fontName=PDF_FONT_BOLD, fontSize=8.5, leading=10.5, textColor=colors.HexColor("#111111"))
-    small = ParagraphStyle("SmallBot", parent=styles["Normal"], fontName=PDF_FONT_BOLD, fontSize=7.0, leading=8.1, textColor=colors.HexColor("#333333"))
-    label = ParagraphStyle("Label", parent=styles["Normal"], fontName=PDF_FONT_BOLD, fontSize=8.5, leading=10.2, textColor=navy)
-    value = ParagraphStyle("Value", parent=styles["Normal"], fontName=PDF_FONT_BOLD, fontSize=8.5, leading=10.2, textColor=colors.HexColor("#111111"))
-    note_style = ParagraphStyle("Note", parent=styles["Normal"], fontName=PDF_FONT_BOLD, fontSize=7.2, leading=8.6, textColor=colors.HexColor("#3B3B3B"))
-
-    story = []
-
-    title_block = [
-        p(REPORT_TITLE, title_style),
-        p("Stage 1 Grade Report | Al-Kindy College of Medicine", subtitle_style),
-        p(f"{BATCH_NAME} | Developed by {DEVELOPER_NAME}", subtitle_style),
-    ]
-    if os.path.exists(LOGO_PATH):
-        logo = Image(LOGO_PATH, width=3.0 * cm, height=1.8 * cm, kind="proportional")
-        header = Table([[title_block, logo]], colWidths=[13.3 * cm, 3.6 * cm], hAlign="LEFT")
-    else:
-        header = Table([[title_block]], colWidths=[16.9 * cm], hAlign="LEFT")
-    header.setStyle(TableStyle([
-        ("VALIGN", (0, 0), (-1, -1), "MIDDLE"),
-        ("BACKGROUND", (0, 0), (-1, -1), colors.white),
-        ("BOX", (0, 0), (-1, -1), 0.8, navy),
-        ("LINEBELOW", (0, 0), (-1, -1), 1.2, accent),
-        ("PADDING", (0, 0), (-1, -1), 8),
-    ]))
-    story.append(header)
-    story.append(Spacer(1, 0.20 * cm))
-
-    # Privacy-friendly report: no Telegram username, Telegram ID, or hidden account details appear to students.
-    info_data = [
-        [p("Student Name", label), p(student_name, value), p("Stage", label), p("First Year", value)],
-        [p("Report Date", label), p(iraq_now().strftime("%Y-%m-%d %H:%M") + " | Iraq Time", value), p("College", label), p(COLLEGE_NAME, value)],
-    ]
-    info_table = Table(info_data, colWidths=[2.8 * cm, 5.7 * cm, 2.8 * cm, 5.6 * cm], hAlign="LEFT")
-    info_table.setStyle(TableStyle([
-        ("BACKGROUND", (0, 0), (-1, -1), colors.white),
-        ("BOX", (0, 0), (-1, -1), 0.75, navy),
-        ("INNERGRID", (0, 0), (-1, -1), 0.25, line),
-        ("PADDING", (0, 0), (-1, -1), 6.0),
-        ("VALIGN", (0, 0), (-1, -1), "MIDDLE"),
-    ]))
-    story.append(info_table)
-    story.append(Spacer(1, 0.23 * cm))
-
-    if mode == "grades":
-        res_data = [
-            [p("Metric", label), p("Minimum", label), p("Middle", label), p("Maximum", label)],
-            [p("Stage average", value), p(f"{result['min_avg']:.2f}%", value), p(f"{result['avg_avg']:.2f}%", value), p(f"{result['max_avg']:.2f}%", value)],
-            [p("Stage 1 impact in final cumulative grade", value), p(f"{result['min_contribution']:.2f}%", value), p(f"{result['avg_contribution']:.2f}%", value), p(f"{result['max_contribution']:.2f}%", value)],
-        ]
-        mode_note = "Grade categories give a range; numeric scores give the exact result."
-    else:
-        res_data = [
-            [p("Metric", label), p("Value", label)],
-            [p("Stage average", value), p(f"{result['avg']:.2f}%", value)],
-            [p("Stage 1 impact in final cumulative grade", value), p(f"{result['contribution']:.2f}%", value)],
-        ]
-        mode_note = "Numeric scores were used, so the result is exact based on entered values."
-
-    result_title = Table([[p("Final Result", subtitle_style), p(mode_note, note_style)]], colWidths=[4.0 * cm, 12.9 * cm], hAlign="LEFT")
-    result_title.setStyle(TableStyle([
-        ("BACKGROUND", (0, 0), (-1, -1), soft),
-        ("BOX", (0, 0), (-1, -1), 0.65, navy),
-        ("LINEBELOW", (0, 0), (-1, -1), 0.8, accent),
-        ("PADDING", (0, 0), (-1, -1), 6),
-        ("VALIGN", (0, 0), (-1, -1), "MIDDLE"),
-    ]))
-    story.append(result_title)
-
-    if mode == "grades":
-        result_table = Table(res_data, colWidths=[6.3 * cm, 3.5 * cm, 3.5 * cm, 3.6 * cm], hAlign="LEFT")
-    else:
-        result_table = Table(res_data, colWidths=[10.0 * cm, 6.9 * cm], hAlign="LEFT")
-    result_table.setStyle(TableStyle([
-        ("BACKGROUND", (0, 0), (-1, 0), navy),
-        ("TEXTCOLOR", (0, 0), (-1, 0), colors.white),
-        ("GRID", (0, 0), (-1, -1), 0.35, colors.white),
-        ("BACKGROUND", (0, 1), (-1, -1), soft),
-        ("ALIGN", (1, 0), (-1, -1), "CENTER"),
-        ("VALIGN", (0, 0), (-1, -1), "MIDDLE"),
-        ("PADDING", (0, 0), (-1, -1), 6.5),
-    ]))
-    story.append(result_table)
-    story.append(Spacer(1, 0.20 * cm))
-
-    if mode == "grades":
-        data = [[p("Subject", normal), p("Cr", normal), p("Grade", normal), p("Range", normal), p("Impact in final", normal)]]
-        for item in answers:
-            cmin = item["min_score"] * item["credits"] / TOTAL_CREDITS * STAGE_WEIGHT_PERCENT / 100
-            cmax = item["max_score"] * item["credits"] / TOTAL_CREDITS * STAGE_WEIGHT_PERCENT / 100
-            data.append([
-                p(item["subject_en"], small),
-                p(str(item["credits"]), small),
-                p(item["grade_en"], small),
-                p(f"{item['min_score']}-{item['max_score']}", small),
-                p(f"{cmin:.2f}%-{cmax:.2f}%", small),
-            ])
-        col_widths = [6.8 * cm, 1.0 * cm, 2.3 * cm, 2.1 * cm, 4.7 * cm]
-    else:
-        data = [[p("Subject", normal), p("Cr", normal), p("Score", normal), p("Impact in final", normal)]]
-        for item in answers:
-            contrib = item["score"] * item["credits"] / TOTAL_CREDITS * STAGE_WEIGHT_PERCENT / 100
-            data.append([p(item["subject_en"], small), p(str(item["credits"]), small), p(f"{item['score']:.2f}", small), p(f"{contrib:.2f}%", small)])
-        col_widths = [8.2 * cm, 1.2 * cm, 2.6 * cm, 4.9 * cm]
-
-    table = Table(data, repeatRows=1, colWidths=col_widths)
-    table.setStyle(TableStyle([
-        ("BACKGROUND", (0, 0), (-1, 0), navy),
-        ("TEXTCOLOR", (0, 0), (-1, 0), colors.white),
-        ("GRID", (0, 0), (-1, -1), 0.25, colors.white),
-        ("ROWBACKGROUNDS", (0, 1), (-1, -1), [colors.white, row_alt]),
-        ("ALIGN", (1, 1), (-1, -1), "CENTER"),
-        ("VALIGN", (0, 0), (-1, -1), "MIDDLE"),
-        ("PADDING", (0, 0), (-1, -1), 3.8),
-    ]))
-    story.append(table)
-    story.append(Spacer(1, 0.16 * cm))
-    story.append(p("Stage 1 impact is shown as a percent of the final cumulative grade. This report is generated automatically and is not an official college transcript.", note_style))
-
-    doc.build(story, onFirstPage=page_background, onLaterPages=page_background)
+    image = draw_clean_pdf_image(student_name, answers, result, mode)
+    # Saving the rendered A4 image as PDF makes Arabic output reliable across PDF viewers.
+    image.save(path, "PDF", resolution=150.0)
     return path, send_filename
 
 # -------------------------- Telegram handlers --------------------------
