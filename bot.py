@@ -787,9 +787,17 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     clear_calc(context)
     name = context.user_data.get("student_name", "غير مضاف")
     text = (
-        f"<b>أهلًا بك في {escape(BOT_TITLE)} 👋</b>\n\n"
-        f"<b>اسم الطالب الحالي:</b> {escape(name)}\n"
-        "<b>اختار من لوحة الكيبورد بالأسفل.</b>"
+        text = (
+        f"<b>👋 أهلًا بك في {escape(BOT_TITLE)}</b>\n\n"
+        "بوت مخصص لطلاب <b>دفعة 27</b> لحساب معدل المرحلة الأولى ومساهمتها في التراكمي النهائي.\n\n"
+        "⏳ <b>مدة التفعيل:</b>\n"
+        "يتم تفعيل البوت لمدة شهر واحد بعد إعلان نتائج الدور الأول أو الدور الثاني.\n\n"
+        "⚠️ <b>تنبيه مهم:</b>\n"
+        "تجنّب حذف البوت أو عمل <b>Block / Stop Bot</b>، لأن ذلك قد يمنعك تلقائيًا من استخدامه مرة أخرى.\n\n"
+        "للدعم وإعادة التفعيل:\n"
+        "@KMC27bot\n\n"
+        "بالتوفيق للجميع 🌿\n"
+    
     )
     await update.effective_message.reply_text(text, parse_mode=ParseMode.HTML, reply_markup=main_keyboard_for(update))
     return MAIN
