@@ -26,6 +26,7 @@ from telegram.ext import (
     ConversationHandler,
     MessageHandler,
     PicklePersistence,
+    ChatMemberHandler,
     filters,
 )
 
@@ -50,7 +51,7 @@ except Exception:
 logging.basicConfig(format="%(asctime)s - %(name)s - %(levelname)s - %(message)s", level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-MAIN, ASK_NAME, MODE, COLLECT = range(4)
+MAIN, ASK_NAME, MODE, COLLECT, ASK_BAN, ASK_UNBAN = range(6)
 TOTAL_CREDITS = 36
 STAGE_WEIGHT_PERCENT = 5
 BOT_TITLE = "KMC B27 | Grade Calculator"
@@ -108,8 +109,8 @@ GRADES: Dict[str, Tuple[str, int, int]] = {
 }
 
 MAIN_ROWS = [
-    ["🧮 حساب المعدل", "📝 إضافة/تغيير الاسم"],
-    ["📚 عرض المواد"],
+    ["🧮 حساب المعدل"],
+    ["📚 عرض المواد", "📌 عن البوت"],
     ["ℹ️ المساعدة", "🔄 إعادة البداية"],
 ]
 
@@ -119,6 +120,8 @@ ADMIN_KEYBOARD = ReplyKeyboardMarkup(
         ["👥 قائمة المستخدمين الكاملة"],
         ["📁 ملفات آخر 24 ساعة"],
         ["🔎 فحص حالة المستخدمين"],
+        ["🚫 حظر مستخدم", "✅ رفع حظر"],
+        ["📄 قائمة المحظورين"],
         ["🔙 رجوع"],
     ],
     resize_keyboard=True,
@@ -211,7 +214,10 @@ def init_db() -> None:
                 first_seen TEXT,
                 last_seen TEXT,
                 status TEXT DEFAULT 'unknown',
-                last_status_check TEXT
+                last_status_check TEXT,
+                banned INTEGER DEFAULT 0,
+                ban_reason TEXT,
+                banned_at TEXT
             )
             """
         )
@@ -234,6 +240,9 @@ def init_db() -> None:
         for col, ddl in [
             ("status", "ALTER TABLE users ADD COLUMN status TEXT DEFAULT 'unknown'"),
             ("last_status_check", "ALTER TABLE users ADD COLUMN last_status_check TEXT"),
+            ("banned", "ALTER TABLE users ADD COLUMN banned INTEGER DEFAULT 0"),
+            ("ban_reason", "ALTER TABLE users ADD COLUMN ban_reason TEXT"),
+            ("banned_at", "ALTER TABLE users ADD COLUMN banned_at TEXT"),
         ]:
             try:
                 con.execute(ddl)
@@ -304,11 +313,190 @@ def increment_calculation(update: Update) -> None:
 def update_user_status(telegram_id: int, status: str) -> None:
     init_db()
     with sqlite3.connect(DB_PATH) as con:
+        if status == "blocked":
+            con.execute(
+                """
+                UPDATE users
+                SET status = ?, last_status_check = ?, banned = 1,
+                    ban_reason = COALESCE(NULLIF(ban_reason, ''), 'blocked_bot'),
+                    banned_at = COALESCE(banned_at, ?)
+                WHERE telegram_id = ?
+                """,
+                (status, now_str(), now_str(), telegram_id),
+            )
+        else:
+            con.execute(
+                "UPDATE users SET status = ?, last_status_check = ? WHERE telegram_id = ?",
+                (status, now_str(), telegram_id),
+            )
+        con.commit()
+
+
+def get_user_ban_info(telegram_id: int) -> Optional[tuple]:
+    init_db()
+    with sqlite3.connect(DB_PATH) as con:
+        row = con.execute(
+            "SELECT banned, ban_reason, banned_at FROM users WHERE telegram_id = ?",
+            (telegram_id,),
+        ).fetchone()
+    return row
+
+
+def is_user_banned(telegram_id: Optional[int]) -> bool:
+    if not telegram_id or is_admin_user(telegram_id):
+        return False
+    row = get_user_ban_info(telegram_id)
+    return bool(row and row[0])
+
+
+def ban_user_by_id(telegram_id: int, reason: str = "manual_admin") -> bool:
+    init_db()
+    with sqlite3.connect(DB_PATH) as con:
+        exists = con.execute("SELECT 1 FROM users WHERE telegram_id = ?", (telegram_id,)).fetchone()
+        if not exists:
+            return False
         con.execute(
-            "UPDATE users SET status = ?, last_status_check = ? WHERE telegram_id = ?",
-            (status, now_str(), telegram_id),
+            """
+            UPDATE users
+            SET banned = 1, status = 'banned', ban_reason = ?, banned_at = ?, last_status_check = ?
+            WHERE telegram_id = ?
+            """,
+            (reason, now_str(), now_str(), telegram_id),
         )
         con.commit()
+    return True
+
+
+
+
+def unban_user_by_id(telegram_id: int, reason: str = "admin_restore") -> bool:
+    init_db()
+    with sqlite3.connect(DB_PATH) as con:
+        exists = con.execute("SELECT 1 FROM users WHERE telegram_id = ?", (telegram_id,)).fetchone()
+        if not exists:
+            return False
+        con.execute(
+            """
+            UPDATE users
+            SET banned = 0, status = 'restored', ban_reason = NULL, banned_at = NULL, last_status_check = ?
+            WHERE telegram_id = ?
+            """,
+            (now_str(), telegram_id),
+        )
+        con.commit()
+    return True
+
+
+def upsert_chat_member_user(member_update) -> None:
+    """Store user data from my_chat_member updates.
+
+    Telegram sends this update when a user blocks/unblocks the bot in private chat.
+    """
+    init_db()
+    chat = getattr(member_update, "chat", None)
+    from_user = getattr(member_update, "from_user", None)
+    telegram_id = getattr(chat, "id", None) or getattr(from_user, "id", None)
+    if not telegram_id:
+        return
+    first_name = getattr(from_user, "first_name", "") or getattr(chat, "first_name", "") or ""
+    last_name = getattr(from_user, "last_name", "") or getattr(chat, "last_name", "") or ""
+    username = getattr(from_user, "username", "") or getattr(chat, "username", "") or ""
+    with sqlite3.connect(DB_PATH) as con:
+        con.execute(
+            """
+            INSERT INTO users (telegram_id, first_name, last_name, username, calculations, first_seen, last_seen, status)
+            VALUES (?, ?, ?, ?, 0, ?, ?, COALESCE((SELECT status FROM users WHERE telegram_id = ?), 'unknown'))
+            ON CONFLICT(telegram_id) DO UPDATE SET
+                first_name=CASE WHEN excluded.first_name != '' THEN excluded.first_name ELSE users.first_name END,
+                last_name=CASE WHEN excluded.last_name != '' THEN excluded.last_name ELSE users.last_name END,
+                username=CASE WHEN excluded.username != '' THEN excluded.username ELSE users.username END,
+                last_seen=excluded.last_seen
+            """,
+            (telegram_id, first_name, last_name, username, now_str(), now_str(), telegram_id),
+        )
+        con.commit()
+
+def find_user_identifier(identifier: str) -> Optional[tuple]:
+    init_db()
+    ident = (identifier or "").strip()
+    ident_clean = ident[1:] if ident.startswith("@") else ident
+    with sqlite3.connect(DB_PATH) as con:
+        if ident_clean.isdigit():
+            row = con.execute(
+                "SELECT telegram_id, first_name, last_name, username, student_name FROM users WHERE telegram_id = ?",
+                (int(ident_clean),),
+            ).fetchone()
+            if row:
+                return row
+        row = con.execute(
+            "SELECT telegram_id, first_name, last_name, username, student_name FROM users WHERE lower(username) = lower(?)",
+            (ident_clean,),
+        ).fetchone()
+    return row
+
+
+def build_banned_users_txt() -> Optional[str]:
+    init_db()
+    with sqlite3.connect(DB_PATH) as con:
+        rows = con.execute(
+            """
+            SELECT telegram_id, first_name, last_name, username, student_name, ban_reason, banned_at, status, last_seen
+            FROM users
+            WHERE banned = 1
+            ORDER BY datetime(COALESCE(banned_at, last_seen)) DESC
+            """
+        ).fetchall()
+    if not rows:
+        return None
+    fd, path = tempfile.mkstemp(prefix="kmc_b27_banned_users_", suffix=".txt")
+    os.close(fd)
+    with open(path, "w", encoding="utf-8-sig") as f:
+        f.write("KMC B27 Grade Calculator - Banned Users List\n")
+        f.write(f"Generated at: {now_str()}\n")
+        f.write(f"Total banned users: {len(rows)}\n")
+        f.write("=" * 80 + "\n\n")
+        for i, (tid, first, last, username, student_name, reason, banned_at, status, last_seen) in enumerate(rows, start=1):
+            tg_name = " ".join(x for x in [first, last] if x).strip() or "No Telegram name"
+            uname = f"@{username}" if username else "No username"
+            reason_text = {
+                "blocked_bot": "Automatic ban: user deleted/blocked the bot",
+                "manual_admin": "Manual ban by admin",
+            }.get(reason or "", reason or "Unknown")
+            f.write(f"{i}. Student Name: {student_name or 'No student name'}\n")
+            f.write(f"   Telegram Name: {tg_name}\n")
+            f.write(f"   Username: {uname}\n")
+            f.write(f"   Telegram ID: {tid}\n")
+            f.write(f"   Reason: {reason_text}\n")
+            f.write(f"   Banned At: {banned_at or 'not recorded'}\n")
+            f.write(f"   Status: {status or 'unknown'}\n")
+            f.write(f"   Last Seen: {last_seen or 'not recorded'}\n")
+            f.write("-" * 80 + "\n")
+    return path
+
+
+def banned_message() -> str:
+    return (
+        "<b>⛔ تم حظرك من استخدام البوت تلقائيًا.</b>\n\n"
+        "تم إيقاف وصولك لأن الحساب قام بحذف أو حظر البوت سابقًا.\n"
+        "لإعادة تفعيل الوصول يرجى التواصل مع المطور عبر بوت التواصل:\n"
+        "<b>@KMC27bot</b>"
+    )
+
+
+async def deny_if_banned(update: Update, context: ContextTypes.DEFAULT_TYPE) -> bool:
+    user = update.effective_user
+    if not user or is_admin_user(user.id):
+        return False
+    upsert_user(update, context)
+    if is_user_banned(user.id):
+        clear_calc(context)
+        await update.effective_message.reply_text(
+            banned_message(),
+            parse_mode=ParseMode.HTML,
+            reply_markup=ReplyKeyboardRemove(),
+        )
+        return True
+    return False
 
 
 def record_report(update: Update, student_name: str, path: str, send_filename: str, mode: str, result: dict) -> None:
@@ -355,7 +543,8 @@ def get_admin_stats() -> dict:
             "reports_total": cur.execute("SELECT COUNT(*) FROM reports").fetchone()[0],
             "reports_24h": cur.execute("SELECT COUNT(*) FROM reports WHERE datetime(created_at) >= datetime(?)", (since_24,)).fetchone()[0],
             "reachable": cur.execute("SELECT COUNT(*) FROM users WHERE status = 'reachable'").fetchone()[0],
-            "blocked": cur.execute("SELECT COUNT(*) FROM users WHERE status = 'blocked'").fetchone()[0],
+            "blocked": cur.execute("SELECT COUNT(*) FROM users WHERE status IN ('blocked', 'returned_blocked', 'banned')").fetchone()[0],
+            "banned": cur.execute("SELECT COUNT(*) FROM users WHERE banned = 1").fetchone()[0],
             "unknown": cur.execute("SELECT COUNT(*) FROM users WHERE status IS NULL OR status = 'unknown'").fetchone()[0],
         }
 
@@ -365,7 +554,7 @@ def get_all_users() -> List[tuple]:
     with sqlite3.connect(DB_PATH) as con:
         return con.execute(
             """
-            SELECT telegram_id, first_name, last_name, username, student_name, calculations, first_seen, last_seen, status, last_status_check
+            SELECT telegram_id, first_name, last_name, username, student_name, calculations, first_seen, last_seen, status, last_status_check, banned, ban_reason, banned_at
             FROM users
             ORDER BY datetime(last_seen) DESC
             """
@@ -381,7 +570,7 @@ def build_users_txt() -> str:
         f.write(f"Generated at: {now_str()}\n")
         f.write(f"Total users: {len(rows)}\n")
         f.write("=" * 80 + "\n\n")
-        for i, (tid, first, last, username, student_name, calculations, first_seen, last_seen, status, last_status_check) in enumerate(rows, start=1):
+        for i, (tid, first, last, username, student_name, calculations, first_seen, last_seen, status, last_status_check, banned, ban_reason, banned_at) in enumerate(rows, start=1):
             tg_name = " ".join(x for x in [first, last] if x).strip() or "No Telegram name"
             uname = f"@{username}" if username else "No username"
             sname = student_name or "No student name"
@@ -391,6 +580,9 @@ def build_users_txt() -> str:
             f.write(f"   Telegram ID: {tid}\n")
             f.write(f"   Calculations: {calculations}\n")
             f.write(f"   Status: {status or 'unknown'}\n")
+            f.write(f"   Banned: {'YES' if banned else 'NO'}\n")
+            f.write(f"   Ban Reason: {ban_reason or 'none'}\n")
+            f.write(f"   Banned At: {banned_at or 'none'}\n")
             f.write(f"   First Seen: {first_seen}\n")
             f.write(f"   Last Seen: {last_seen}\n")
             f.write(f"   Last Status Check: {last_status_check or 'not checked'}\n")
@@ -576,21 +768,21 @@ def create_html_report(student_name: str, answers: List[dict], result: dict, mod
 # -------------------------- Telegram handlers --------------------------
 
 async def post_init(application: Application) -> None:
+    # Public menu only. Admin commands still work when typed manually.
     commands = [
         BotCommand("start", "بدء استخدام البوت"),
         BotCommand("calculate", "حساب المعدل"),
-        BotCommand("rename", "إضافة أو تغيير الاسم"),
         BotCommand("list", "عرض المواد"),
         BotCommand("help", "شرح طريقة الحساب"),
         BotCommand("about", "عن البوت"),
         BotCommand("reset", "إعادة البداية"),
-        BotCommand("myid", "معرفة رقم حسابك"),
-        BotCommand("admin", "لوحة الأدمن"),
     ]
     await application.bot.set_my_commands(commands)
 
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    if await deny_if_banned(update, context):
+        return MAIN
     upsert_user(update, context)
     clear_calc(context)
     name = context.user_data.get("student_name", "غير مضاف")
@@ -604,6 +796,8 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
 
 
 async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    if await deny_if_banned(update, context):
+        return MAIN
     upsert_user(update, context)
     text = (
         "<b>طريقة الحساب المختصرة:</b>\n\n"
@@ -622,6 +816,8 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> in
 
 
 async def about_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    if await deny_if_banned(update, context):
+        return MAIN
     upsert_user(update, context)
     text = (
         "<b>📌 عن البوت</b>\n\n"
@@ -637,6 +833,8 @@ async def about_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> i
 
 
 async def list_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    if await deny_if_banned(update, context):
+        return MAIN
     upsert_user(update, context)
     lines = ["<b>مواد البوت الداخلة بالحساب:</b>", ""]
     for i, s in enumerate(SUBJECTS, start=1):
@@ -648,6 +846,8 @@ async def list_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> in
 
 
 async def reset_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    if await deny_if_banned(update, context):
+        return MAIN
     upsert_user(update, context)
     clear_calc(context)
     context.user_data.pop("student_name", None)
@@ -656,6 +856,8 @@ async def reset_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> i
 
 
 async def ask_name(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    if await deny_if_banned(update, context):
+        return MAIN
     upsert_user(update, context)
     await update.effective_message.reply_text(
         "<b>اكتب اسمك الثلاثي الذي تريد ظهوره داخل تقرير الـ PDF.</b>\n\n"
@@ -667,6 +869,8 @@ async def ask_name(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
 
 
 async def save_name(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    if await deny_if_banned(update, context):
+        return MAIN
     name = update.message.text.strip()
     if name.startswith("/"):
         await update.message.reply_text("<b>اكتب الاسم كنص، وليس أمرًا يبدأ بعلامة /.</b>", parse_mode=ParseMode.HTML)
@@ -681,6 +885,8 @@ async def save_name(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
 
 
 async def begin_calculation(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    if await deny_if_banned(update, context):
+        return MAIN
     upsert_user(update, context)
     clear_calc(context)
     if not context.user_data.get("student_name"):
@@ -695,6 +901,8 @@ async def begin_calculation(update: Update, context: ContextTypes.DEFAULT_TYPE) 
 
 
 async def choose_mode(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    if await deny_if_banned(update, context):
+        return MAIN
     upsert_user(update, context)
     text = update.message.text.strip()
     if text == "❌ إلغاء":
@@ -733,6 +941,8 @@ async def ask_current_subject(update: Update, context: ContextTypes.DEFAULT_TYPE
 
 
 async def collect_answer(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    if await deny_if_banned(update, context):
+        return MAIN
     upsert_user(update, context)
     text = update.message.text.strip()
     if text == "❌ إلغاء":
@@ -897,6 +1107,7 @@ async def admin_stats(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int
         "<b>حالة الوصول بعد آخر فحص:</b>\n"
         f"• قابلون للوصول: <b>{s['reachable']}</b>\n"
         f"• حاذفون/حاظرون البوت: <b>{s['blocked']}</b>\n"
+        f"• محظورون من استخدام البوت: <b>{s['banned']}</b>\n"
         f"• غير مفحوصين: <b>{s['unknown']}</b>\n\n"
         "اضغط <b>🔎 فحص حالة المستخدمين</b> لتحديث حالة الوصول."
     )
@@ -961,13 +1172,178 @@ async def admin_check_status(update: Update, context: ContextTypes.DEFAULT_TYPE)
         f"<b>قابلون للوصول:</b> {reachable}\n"
         f"<b>حاذفون/حاظرون البوت:</b> {blocked}\n"
         f"<b>غير معروف:</b> {failed}\n\n"
-        "ملاحظة: تيليگرام لا يعطي حالة online مباشرة للبوتات؛ هذا الفحص يحدد قابلية الوصول فقط."
+        "ملاحظة: أي حساب يظهر كحاذف/حاظر يتم حفظه تلقائيًا في قائمة المحظورين، وإذا عاد للبوت لاحقًا سيظهر له تنبيه الحظر."
     )
     await update.message.reply_text(text, parse_mode=ParseMode.HTML, reply_markup=ADMIN_KEYBOARD)
     return MAIN
 
 
+async def admin_ask_ban(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    if not require_admin(update):
+        await update.message.reply_text("<b>هذا القسم خاص بمدير البوت فقط.</b>", parse_mode=ParseMode.HTML, reply_markup=main_keyboard_for(update))
+        return MAIN
+    await update.message.reply_text(
+        "<b>🚫 حظر مستخدم</b>\n\n"
+        "أرسل <b>Telegram ID</b> أو <b>@username</b> للمستخدم المراد حظره.\n"
+        "مثال: <code>123456789</code> أو <code>@username</code>",
+        parse_mode=ParseMode.HTML,
+        reply_markup=ReplyKeyboardMarkup([["❌ إلغاء"], ["🔙 رجوع"]], resize_keyboard=True),
+    )
+    return ASK_BAN
+
+
+async def admin_save_ban(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    if not require_admin(update):
+        await update.message.reply_text("<b>هذا القسم خاص بمدير البوت فقط.</b>", parse_mode=ParseMode.HTML, reply_markup=main_keyboard_for(update))
+        return MAIN
+    ident = update.message.text.strip()
+    if ident in {"❌ إلغاء", "🔙 رجوع"}:
+        await update.message.reply_text("<b>تم إلغاء عملية الحظر.</b>", parse_mode=ParseMode.HTML, reply_markup=ADMIN_KEYBOARD)
+        return MAIN
+    row = find_user_identifier(ident)
+    if not row:
+        await update.message.reply_text(
+            "<b>لم أجد هذا المستخدم داخل قاعدة بيانات البوت.</b>\n"
+            "تأكد أن المستخدم سبق أن فتح البوت، ثم أرسل ID أو username الصحيح.",
+            parse_mode=ParseMode.HTML,
+            reply_markup=ADMIN_KEYBOARD,
+        )
+        return MAIN
+    tid, first, last, username, student_name = row
+    if is_admin_user(tid):
+        await update.message.reply_text("<b>لا يمكن حظر حساب أدمن.</b>", parse_mode=ParseMode.HTML, reply_markup=ADMIN_KEYBOARD)
+        return MAIN
+    ok = ban_user_by_id(int(tid), "manual_admin")
+    if ok:
+        name = student_name or " ".join(x for x in [first, last] if x).strip() or "No name"
+        uname = f"@{username}" if username else "No username"
+        await update.message.reply_text(
+            "<b>تم حظر المستخدم بنجاح ✅</b>\n\n"
+            f"<b>الاسم:</b> {escape(name)}\n"
+            f"<b>اليوزر:</b> {escape(uname)}\n"
+            f"<b>ID:</b> <code>{tid}</code>\n"
+            f"<b>وقت الحظر:</b> {now_str()}",
+            parse_mode=ParseMode.HTML,
+            reply_markup=ADMIN_KEYBOARD,
+        )
+    else:
+        await update.message.reply_text("<b>فشلت عملية الحظر.</b>", parse_mode=ParseMode.HTML, reply_markup=ADMIN_KEYBOARD)
+    return MAIN
+
+
+
+
+async def admin_ask_unban(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    if not require_admin(update):
+        await update.message.reply_text("<b>هذا القسم خاص بمدير البوت فقط.</b>", parse_mode=ParseMode.HTML, reply_markup=main_keyboard_for(update))
+        return MAIN
+    await update.message.reply_text(
+        "<b>✅ رفع حظر مستخدم</b>\n\n"
+        "أرسل <b>Telegram ID</b> أو <b>@username</b> للمستخدم المراد رفع الحظر عنه.\n"
+        "مثال: <code>123456789</code> أو <code>@username</code>",
+        parse_mode=ParseMode.HTML,
+        reply_markup=ReplyKeyboardMarkup([["❌ إلغاء"], ["🔙 رجوع"]], resize_keyboard=True),
+    )
+    return ASK_UNBAN
+
+
+async def admin_save_unban(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    if not require_admin(update):
+        await update.message.reply_text("<b>هذا القسم خاص بمدير البوت فقط.</b>", parse_mode=ParseMode.HTML, reply_markup=main_keyboard_for(update))
+        return MAIN
+    ident = update.message.text.strip()
+    if ident in {"❌ إلغاء", "🔙 رجوع"}:
+        await update.message.reply_text("<b>تم إلغاء عملية رفع الحظر.</b>", parse_mode=ParseMode.HTML, reply_markup=ADMIN_KEYBOARD)
+        return MAIN
+    row = find_user_identifier(ident)
+    if not row:
+        await update.message.reply_text(
+            "<b>لم أجد هذا المستخدم داخل قاعدة بيانات البوت.</b>\n"
+            "تأكد أن المستخدم سبق أن فتح البوت، ثم أرسل ID أو username الصحيح.",
+            parse_mode=ParseMode.HTML,
+            reply_markup=ADMIN_KEYBOARD,
+        )
+        return MAIN
+    tid, first, last, username, student_name = row
+    ok = unban_user_by_id(int(tid))
+    if ok:
+        name = student_name or " ".join(x for x in [first, last] if x).strip() or "No name"
+        uname = f"@{username}" if username else "No username"
+        await update.message.reply_text(
+            "<b>تم رفع الحظر عن المستخدم بنجاح ✅</b>\n\n"
+            f"<b>الاسم:</b> {escape(name)}\n"
+            f"<b>اليوزر:</b> {escape(uname)}\n"
+            f"<b>ID:</b> <code>{tid}</code>\n"
+            f"<b>وقت التعديل:</b> {now_str()}",
+            parse_mode=ParseMode.HTML,
+            reply_markup=ADMIN_KEYBOARD,
+        )
+    else:
+        await update.message.reply_text("<b>فشلت عملية رفع الحظر.</b>", parse_mode=ParseMode.HTML, reply_markup=ADMIN_KEYBOARD)
+    return MAIN
+
+async def admin_banned_list(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    if not require_admin(update):
+        await update.message.reply_text("<b>هذا القسم خاص بمدير البوت فقط.</b>", parse_mode=ParseMode.HTML, reply_markup=main_keyboard_for(update))
+        return MAIN
+    path = build_banned_users_txt()
+    if not path:
+        await update.message.reply_text("<b>لا توجد حسابات محظورة حاليًا.</b>", parse_mode=ParseMode.HTML, reply_markup=ADMIN_KEYBOARD)
+        return MAIN
+    with open(path, "rb") as f:
+        await update.message.reply_document(
+            document=f,
+            filename="kmc_b27_banned_users.txt",
+            caption="<b>قائمة المحظورين - خاصة بالأدمن فقط.</b>",
+            parse_mode=ParseMode.HTML,
+        )
+    try:
+        os.remove(path)
+    except OSError:
+        pass
+    return MAIN
+
+
+
+
+async def my_chat_member_update(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Automatic block/unblock detector.
+
+    If a user blocks/deletes the bot from their side, Telegram sends a
+    my_chat_member update with a kicked/left status. We store and ban the
+    account automatically. If the user later unblocks the bot, the ban remains
+    until the admin restores the user manually.
+    """
+    member_update = update.my_chat_member
+    if not member_update:
+        return
+    chat = member_update.chat
+    if getattr(chat, "type", "") != "private":
+        return
+
+    telegram_id = chat.id
+    if is_admin_user(telegram_id):
+        return
+
+    upsert_chat_member_user(member_update)
+    new_status = getattr(member_update.new_chat_member, "status", "")
+    old_status = getattr(member_update.old_chat_member, "status", "")
+
+    # Typical private-chat bot statuses:
+    # member = user can use the bot, kicked = user blocked the bot.
+    if new_status in {"kicked", "left"}:
+        update_user_status(telegram_id, "blocked")
+        logger.info("Auto-ban: user %s changed bot status from %s to %s", telegram_id, old_status, new_status)
+    elif new_status in {"member", "administrator"}:
+        # Keep an existing ban. The user must contact the developer to restore access.
+        if not is_user_banned(telegram_id):
+            update_user_status(telegram_id, "reachable")
+        else:
+            update_user_status(telegram_id, "returned_blocked")
+
 async def main_menu_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    if await deny_if_banned(update, context):
+        return MAIN
     upsert_user(update, context)
     text = update.message.text.strip()
     if text == "🧮 حساب المعدل":
@@ -992,6 +1368,12 @@ async def main_menu_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) 
         return await admin_reports_24h(update, context)
     if text == "🔎 فحص حالة المستخدمين":
         return await admin_check_status(update, context)
+    if text == "🚫 حظر مستخدم":
+        return await admin_ask_ban(update, context)
+    if text == "✅ رفع حظر":
+        return await admin_ask_unban(update, context)
+    if text == "📄 قائمة المحظورين":
+        return await admin_banned_list(update, context)
     if text == "🔙 رجوع":
         return await start(update, context)
     await update.message.reply_text("<b>اختار من أزرار الكيبورد بالأسفل.</b>", parse_mode=ParseMode.HTML, reply_markup=main_keyboard_for(update))
@@ -1010,6 +1392,7 @@ def main() -> None:
     application.add_handler(CommandHandler("myid", myid_command))
     application.add_handler(CommandHandler("admin", admin_panel))
     application.add_handler(CommandHandler("about", about_command))
+    application.add_handler(ChatMemberHandler(my_chat_member_update, ChatMemberHandler.MY_CHAT_MEMBER))
 
     conv = ConversationHandler(
         entry_points=[CommandHandler("start", start), CommandHandler("calculate", begin_calculation), CommandHandler("rename", ask_name)],
@@ -1018,6 +1401,8 @@ def main() -> None:
             ASK_NAME: [MessageHandler(filters.TEXT & ~filters.COMMAND, save_name)],
             MODE: [MessageHandler(filters.TEXT & ~filters.COMMAND, choose_mode)],
             COLLECT: [MessageHandler(filters.TEXT & ~filters.COMMAND, collect_answer)],
+            ASK_BAN: [MessageHandler(filters.TEXT & ~filters.COMMAND, admin_save_ban)],
+            ASK_UNBAN: [MessageHandler(filters.TEXT & ~filters.COMMAND, admin_save_unban)],
         },
         fallbacks=[
             CommandHandler("reset", reset_command),
