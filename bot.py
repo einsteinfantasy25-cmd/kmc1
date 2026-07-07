@@ -1,9 +1,13 @@
 import logging
 import os
 import re
+import sqlite3
+import csv
+import tempfile
+from html import escape
 from dataclasses import dataclass
 from datetime import datetime
-from typing import Dict, List, Tuple
+from typing import Dict, List, Tuple, Set, Optional
 
 from telegram import BotCommand, ReplyKeyboardMarkup, ReplyKeyboardRemove, Update
 from telegram.constants import ParseMode
@@ -47,6 +51,7 @@ COLLEGE_NAME = "Al-Kindy College of Medicine"
 BATCH_NAME = "Batch 27"
 DEVELOPER_NAME = "Osama"
 LOGO_PATH = os.path.join(os.path.dirname(__file__), "logo.png")
+DB_PATH = os.getenv("USERS_DB_PATH", os.path.join(os.getcwd(), "users.db"))
 
 
 @dataclass(frozen=True)
@@ -85,8 +90,10 @@ GRADES: Dict[str, Tuple[str, int, int]] = {
     "راسب": ("Fail", 0, 49),
 }
 
-MAIN_KEYBOARD = ReplyKeyboardMarkup(
-    [["🧮 حساب المعدل", "📝 إضافة/تغيير الاسم"], ["📚 عرض المواد", "ℹ️ المساعدة"], ["🔄 إعادة البداية"]],
+MAIN_ROWS = [["🧮 حساب المعدل", "📝 إضافة/تغيير الاسم"], ["📚 عرض المواد", "ℹ️ المساعدة"], ["🔄 إعادة البداية"]]
+
+ADMIN_KEYBOARD = ReplyKeyboardMarkup(
+    [["📊 إحصائيات", "👥 قائمة المستخدمين"], ["📤 تصدير CSV"], ["🔙 رجوع"]],
     resize_keyboard=True,
 )
 
@@ -101,6 +108,152 @@ GRADE_KEYBOARD = ReplyKeyboardMarkup(
     resize_keyboard=True,
     one_time_keyboard=True,
 )
+
+
+def get_admin_ids() -> Set[int]:
+    raw = os.getenv("ADMIN_IDS", "")
+    ids: Set[int] = set()
+    for part in raw.replace(" ", "").split(","):
+        if part.isdigit():
+            ids.add(int(part))
+    return ids
+
+
+def is_admin_user(user_id: Optional[int]) -> bool:
+    return bool(user_id and user_id in get_admin_ids())
+
+
+def main_keyboard_for(update: Update) -> ReplyKeyboardMarkup:
+    rows = [row[:] for row in MAIN_ROWS]
+    if update.effective_user and is_admin_user(update.effective_user.id):
+        rows.append(["🛠 لوحة الأدمن"])
+    return ReplyKeyboardMarkup(rows, resize_keyboard=True)
+
+
+def init_db() -> None:
+    with sqlite3.connect(DB_PATH) as con:
+        con.execute(
+            """
+            CREATE TABLE IF NOT EXISTS users (
+                telegram_id INTEGER PRIMARY KEY,
+                first_name TEXT,
+                last_name TEXT,
+                username TEXT,
+                student_name TEXT,
+                calculations INTEGER DEFAULT 0,
+                first_seen TEXT,
+                last_seen TEXT
+            )
+            """
+        )
+        con.commit()
+
+
+def upsert_user(update: Update, context: Optional[ContextTypes.DEFAULT_TYPE] = None) -> None:
+    user = update.effective_user
+    if not user:
+        return
+    init_db()
+    now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    student_name = ""
+    if context is not None:
+        student_name = context.user_data.get("student_name", "") or ""
+    with sqlite3.connect(DB_PATH) as con:
+        con.execute(
+            """
+            INSERT INTO users (telegram_id, first_name, last_name, username, student_name, calculations, first_seen, last_seen)
+            VALUES (?, ?, ?, ?, ?, 0, ?, ?)
+            ON CONFLICT(telegram_id) DO UPDATE SET
+                first_name=excluded.first_name,
+                last_name=excluded.last_name,
+                username=excluded.username,
+                student_name=CASE WHEN excluded.student_name != '' THEN excluded.student_name ELSE users.student_name END,
+                last_seen=excluded.last_seen
+            """,
+            (user.id, user.first_name or "", user.last_name or "", user.username or "", student_name, now, now),
+        )
+        con.commit()
+
+
+def set_student_name_in_db(update: Update, student_name: str) -> None:
+    if not update.effective_user:
+        return
+    init_db()
+    now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    with sqlite3.connect(DB_PATH) as con:
+        con.execute(
+            """
+            INSERT INTO users (telegram_id, first_name, last_name, username, student_name, calculations, first_seen, last_seen)
+            VALUES (?, ?, ?, ?, ?, 0, ?, ?)
+            ON CONFLICT(telegram_id) DO UPDATE SET
+                first_name=excluded.first_name,
+                last_name=excluded.last_name,
+                username=excluded.username,
+                student_name=excluded.student_name,
+                last_seen=excluded.last_seen
+            """,
+            (update.effective_user.id, update.effective_user.first_name or "", update.effective_user.last_name or "", update.effective_user.username or "", student_name, now, now),
+        )
+        con.commit()
+
+
+def increment_calculation(update: Update) -> None:
+    if not update.effective_user:
+        return
+    init_db()
+    now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    with sqlite3.connect(DB_PATH) as con:
+        con.execute(
+            "UPDATE users SET calculations = COALESCE(calculations, 0) + 1, last_seen = ? WHERE telegram_id = ?",
+            (now, update.effective_user.id),
+        )
+        con.commit()
+
+
+def get_admin_stats() -> dict:
+    init_db()
+    with sqlite3.connect(DB_PATH) as con:
+        cur = con.cursor()
+        total_users = cur.execute("SELECT COUNT(*) FROM users").fetchone()[0]
+        named_users = cur.execute("SELECT COUNT(*) FROM users WHERE student_name IS NOT NULL AND student_name != ''").fetchone()[0]
+        total_calcs = cur.execute("SELECT COALESCE(SUM(calculations), 0) FROM users").fetchone()[0]
+        return {"total_users": total_users, "named_users": named_users, "total_calcs": total_calcs}
+
+
+def get_recent_users(limit: int = 50) -> List[tuple]:
+    init_db()
+    with sqlite3.connect(DB_PATH) as con:
+        return con.execute(
+            """
+            SELECT telegram_id, first_name, last_name, username, student_name, calculations, last_seen
+            FROM users
+            ORDER BY datetime(last_seen) DESC
+            LIMIT ?
+            """,
+            (limit,),
+        ).fetchall()
+
+
+def export_users_csv() -> str:
+    init_db()
+    fd, path = tempfile.mkstemp(prefix="kmc_b27_users_", suffix=".csv")
+    os.close(fd)
+    with sqlite3.connect(DB_PATH) as con, open(path, "w", newline="", encoding="utf-8-sig") as f:
+        writer = csv.writer(f)
+        writer.writerow(["telegram_id", "first_name", "last_name", "username", "student_name", "calculations", "first_seen", "last_seen"])
+        for row in con.execute(
+            """
+            SELECT telegram_id, first_name, last_name, username, student_name, calculations, first_seen, last_seen
+            FROM users
+            ORDER BY datetime(last_seen) DESC
+            """
+        ):
+            writer.writerow(row)
+    return path
+
+
+def require_admin(update: Update) -> bool:
+    return bool(update.effective_user and is_admin_user(update.effective_user.id))
 
 
 def register_fonts() -> Tuple[str, str]:
@@ -166,11 +319,14 @@ async def post_init(application: Application) -> None:
         BotCommand("list", "عرض المواد"),
         BotCommand("help", "شرح طريقة الحساب"),
         BotCommand("reset", "إعادة البداية"),
+        BotCommand("myid", "معرفة رقم حسابك"),
+        BotCommand("admin", "لوحة الأدمن"),
     ]
     await application.bot.set_my_commands(commands)
 
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    upsert_user(update, context)
     clear_calc(context)
     name = context.user_data.get("student_name", "غير مضاف")
     text = (
@@ -178,11 +334,12 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
         f"اسم الطالب الحالي: {name}\n"
         "اختار من لوحة الكيبورد بالأسفل."
     )
-    await update.effective_message.reply_text(text, reply_markup=MAIN_KEYBOARD)
+    await update.effective_message.reply_text(text, reply_markup=main_keyboard_for(update))
     return MAIN
 
 
 async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    upsert_user(update, context)
     text = (
         "طريقة الحساب:\n"
         "• بالتقديرات: يعطي أقل وأعلى معدل ممكن.\n"
@@ -192,28 +349,31 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> in
         "مساهمة المرحلة بالتراكمي = معدل المرحلة × 0.05\n\n"
         "بعد اكتمال الحساب يرسل البوت تقرير PDF باسم الطالب."
     )
-    await update.effective_message.reply_text(text, reply_markup=MAIN_KEYBOARD)
+    await update.effective_message.reply_text(text, reply_markup=main_keyboard_for(update))
     return MAIN
 
 
 async def list_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    upsert_user(update, context)
     lines = ["مواد البوت الداخلة بالحساب:", ""]
     for i, s in enumerate(SUBJECTS, start=1):
         lines.append(f"{i}. {s.en} - {s.ar} ({s.credits} cr)")
     lines.append("")
     lines.append(f"المجموع = {TOTAL_CREDITS} credits")
-    await update.effective_message.reply_text("\n".join(lines), reply_markup=MAIN_KEYBOARD)
+    await update.effective_message.reply_text("\n".join(lines), reply_markup=main_keyboard_for(update))
     return MAIN
 
 
 async def reset_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    upsert_user(update, context)
     clear_calc(context)
     context.user_data.pop("student_name", None)
-    await update.effective_message.reply_text("تمت إعادة البداية وحذف الاسم المؤقت.", reply_markup=MAIN_KEYBOARD)
+    await update.effective_message.reply_text("تمت إعادة البداية وحذف الاسم المؤقت.", reply_markup=main_keyboard_for(update))
     return MAIN
 
 
 async def ask_name(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    upsert_user(update, context)
     await update.effective_message.reply_text(
         "اكتب اسم الطالب أو اليوزرنيم الذي تريد يظهر باسم ملف الـ PDF.\nمثال: Osama أو @osama200",
         reply_markup=ReplyKeyboardRemove(),
@@ -223,15 +383,21 @@ async def ask_name(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
 
 async def save_name(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     name = update.message.text.strip()
-    if len(name) < 2:
-        await update.message.reply_text("اكتب اسم واضح أكثر من حرف واحد.")
+    if name.startswith("/"):
+        await update.message.reply_text("اكتب الاسم كنص، مو أمر يبدأ بعلامة /.")
+        return ASK_NAME
+    # يقبل العربي، الإنكليزي، المسافات، @ والرموز البسيطة.
+    if len(name.replace("@", "").strip()) < 2:
+        await update.message.reply_text("اكتب اسم واضح أكثر من حرف واحد. يقبل عربي أو إنكليزي.")
         return ASK_NAME
     context.user_data["student_name"] = name
-    await update.message.reply_text(f"تم حفظ الاسم: {name} ✅", reply_markup=MAIN_KEYBOARD)
+    set_student_name_in_db(update, name)
+    await update.message.reply_text(f"تم حفظ الاسم: {name} ✅", reply_markup=main_keyboard_for(update))
     return MAIN
 
 
 async def begin_calculation(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    upsert_user(update, context)
     clear_calc(context)
     if not context.user_data.get("student_name"):
         await update.effective_message.reply_text(
@@ -244,10 +410,11 @@ async def begin_calculation(update: Update, context: ContextTypes.DEFAULT_TYPE) 
 
 
 async def choose_mode(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    upsert_user(update, context)
     text = update.message.text.strip()
     if text == "❌ إلغاء":
         clear_calc(context)
-        await update.message.reply_text("تم إلغاء الحساب.", reply_markup=MAIN_KEYBOARD)
+        await update.message.reply_text("تم إلغاء الحساب.", reply_markup=main_keyboard_for(update))
         return MAIN
     if text == "📊 حساب بالتقديرات":
         context.user_data["mode"] = "grades"
@@ -276,10 +443,11 @@ async def ask_current_subject(update: Update, context: ContextTypes.DEFAULT_TYPE
 
 
 async def collect_answer(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    upsert_user(update, context)
     text = update.message.text.strip()
     if text == "❌ إلغاء":
         clear_calc(context)
-        await update.message.reply_text("تم إلغاء الحساب.", reply_markup=MAIN_KEYBOARD)
+        await update.message.reply_text("تم إلغاء الحساب.", reply_markup=main_keyboard_for(update))
         return MAIN
 
     idx = context.user_data.get("index", 0)
@@ -322,7 +490,7 @@ async def collect_answer(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         )
     else:
         clear_calc(context)
-        await update.message.reply_text("صار خطأ بسيط. ابدأ من جديد.", reply_markup=MAIN_KEYBOARD)
+        await update.message.reply_text("صار خطأ بسيط. ابدأ من جديد.", reply_markup=main_keyboard_for(update))
         return MAIN
 
     context.user_data["index"] = idx + 1
@@ -337,9 +505,10 @@ async def finish_calculation(update: Update, context: ContextTypes.DEFAULT_TYPE)
     student_name = context.user_data.get("student_name", "student")
     result = calculate_result(answers, mode)
     pdf_path = create_pdf_report(student_name, answers, result, mode)
+    increment_calculation(update)
 
     summary = build_summary_text(result, mode)
-    await update.message.reply_text(summary, parse_mode=ParseMode.HTML, reply_markup=MAIN_KEYBOARD)
+    await update.message.reply_text(summary, parse_mode=ParseMode.HTML, reply_markup=main_keyboard_for(update))
     with open(pdf_path, "rb") as f:
         await update.message.reply_document(document=f, filename=os.path.basename(pdf_path), caption="هذا تقريرك بصيغة PDF ✅")
     try:
@@ -389,6 +558,7 @@ def build_summary_text(result: dict, mode: str) -> str:
 
 def create_pdf_report(student_name: str, answers: List[dict], result: dict, mode: str) -> str:
     filename = f"{safe_filename(student_name)}.pdf"
+    student_name_pdf = ar(student_name)
     path = os.path.join("/tmp", filename)
     doc = SimpleDocTemplate(
         path,
@@ -460,7 +630,7 @@ def create_pdf_report(student_name: str, answers: List[dict], result: dict, mode
     story.append(Spacer(1, 0.25 * cm))
 
     info_data = [
-        ["Name", student_name, "Stage", "First Year"],
+        ["Name", student_name_pdf, "Stage", "First Year"],
         ["Batch", BATCH_NAME, "Date", datetime.now().strftime("%Y-%m-%d %H:%M")],
         ["College", COLLEGE_NAME, "Calculation", "Credits-based"],
     ]
@@ -539,7 +709,89 @@ def create_pdf_report(student_name: str, answers: List[dict], result: dict, mode
     return path
 
 
+async def myid_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    upsert_user(update, context)
+    user = update.effective_user
+    if not user:
+        return MAIN
+    text = (
+        "رقم حسابك في Telegram هو:\n"
+        f"<code>{user.id}</code>\n\n"
+        "حتى تظهر لك لوحة الأدمن فقط، أضف هذا الرقم في Railway داخل Variables باسم ADMIN_IDS."
+    )
+    await update.effective_message.reply_text(text, parse_mode=ParseMode.HTML, reply_markup=main_keyboard_for(update))
+    return MAIN
+
+
+async def admin_panel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    upsert_user(update, context)
+    if not get_admin_ids():
+        await update.effective_message.reply_text(
+            "لوحة الأدمن غير مفعلة بعد.\n"
+            "اكتب /myid وخذ الرقم، ثم أضفه في Railway Variables باسم ADMIN_IDS.",
+            reply_markup=main_keyboard_for(update),
+        )
+        return MAIN
+    if not require_admin(update):
+        await update.effective_message.reply_text("هذا القسم خاص بمدير البوت فقط.", reply_markup=main_keyboard_for(update))
+        return MAIN
+    await update.effective_message.reply_text("لوحة الأدمن الخاصة بك:", reply_markup=ADMIN_KEYBOARD)
+    return MAIN
+
+
+async def admin_stats(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    if not require_admin(update):
+        await update.message.reply_text("هذا القسم خاص بمدير البوت فقط.", reply_markup=main_keyboard_for(update))
+        return MAIN
+    stats = get_admin_stats()
+    text = (
+        "📊 إحصائيات البوت\n\n"
+        f"عدد المستخدمين: {stats['total_users']}\n"
+        f"عدد الأسماء المحفوظة: {stats['named_users']}\n"
+        f"عدد عمليات الحساب: {stats['total_calcs']}"
+    )
+    await update.message.reply_text(text, reply_markup=ADMIN_KEYBOARD)
+    return MAIN
+
+
+async def admin_users(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    if not require_admin(update):
+        await update.message.reply_text("هذا القسم خاص بمدير البوت فقط.", reply_markup=main_keyboard_for(update))
+        return MAIN
+    rows = get_recent_users(limit=50)
+    if not rows:
+        await update.message.reply_text("لا يوجد مستخدمون بعد.", reply_markup=ADMIN_KEYBOARD)
+        return MAIN
+    lines = ["👥 آخر 50 مستخدم:", ""]
+    for i, (tid, first, last, username, student_name, calculations, last_seen) in enumerate(rows, start=1):
+        full = " ".join(x for x in [first, last] if x).strip() or "بدون اسم تيليگرام"
+        uname = f"@{username}" if username else "بدون يوزر"
+        sname = student_name or "لم يضف اسم"
+        lines.append(f"{i}. {sname} | {full} | {uname} | ID: {tid} | حسابات: {calculations}")
+    text = "\n".join(lines)
+    # Telegram message limit safety
+    if len(text) > 3900:
+        text = text[:3900] + "\n...\nللقائمة الكاملة استخدم زر تصدير CSV."
+    await update.message.reply_text(text, reply_markup=ADMIN_KEYBOARD)
+    return MAIN
+
+
+async def admin_export(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    if not require_admin(update):
+        await update.message.reply_text("هذا القسم خاص بمدير البوت فقط.", reply_markup=main_keyboard_for(update))
+        return MAIN
+    path = export_users_csv()
+    with open(path, "rb") as f:
+        await update.message.reply_document(document=f, filename="kmc_b27_users.csv", caption="ملف المستخدمين CSV")
+    try:
+        os.remove(path)
+    except OSError:
+        pass
+    return MAIN
+
+
 async def main_menu_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    upsert_user(update, context)
     text = update.message.text.strip()
     if text == "🧮 حساب المعدل":
         return await begin_calculation(update, context)
@@ -551,7 +803,17 @@ async def main_menu_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) 
         return await help_command(update, context)
     if text == "🔄 إعادة البداية":
         return await reset_command(update, context)
-    await update.message.reply_text("اختار من أزرار الكيبورد بالأسفل.", reply_markup=MAIN_KEYBOARD)
+    if text == "🛠 لوحة الأدمن":
+        return await admin_panel(update, context)
+    if text == "📊 إحصائيات":
+        return await admin_stats(update, context)
+    if text == "👥 قائمة المستخدمين":
+        return await admin_users(update, context)
+    if text == "📤 تصدير CSV":
+        return await admin_export(update, context)
+    if text == "🔙 رجوع":
+        return await start(update, context)
+    await update.message.reply_text("اختار من أزرار الكيبورد بالأسفل.", reply_markup=main_keyboard_for(update))
     return MAIN
 
 
@@ -563,6 +825,9 @@ def main() -> None:
     persistence = PicklePersistence(filepath="bot_state.pickle")
     application = Application.builder().token(token).persistence(persistence).post_init(post_init).build()
 
+    application.add_handler(CommandHandler("myid", myid_command))
+    application.add_handler(CommandHandler("admin", admin_panel))
+
     conv = ConversationHandler(
         entry_points=[CommandHandler("start", start), CommandHandler("calculate", begin_calculation), CommandHandler("rename", ask_name)],
         states={
@@ -571,7 +836,7 @@ def main() -> None:
             MODE: [MessageHandler(filters.TEXT & ~filters.COMMAND, choose_mode)],
             COLLECT: [MessageHandler(filters.TEXT & ~filters.COMMAND, collect_answer)],
         },
-        fallbacks=[CommandHandler("reset", reset_command), CommandHandler("help", help_command), CommandHandler("list", list_command), CommandHandler("start", start)],
+        fallbacks=[CommandHandler("reset", reset_command), CommandHandler("help", help_command), CommandHandler("list", list_command), CommandHandler("start", start), CommandHandler("myid", myid_command), CommandHandler("admin", admin_panel)],
         name="kmc_stage1_pdf_conversation",
         persistent=True,
     )
