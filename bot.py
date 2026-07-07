@@ -787,7 +787,6 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     clear_calc(context)
     name = context.user_data.get("student_name", "غير مضاف")
     text = (
-        text = (
         f"<b>👋 أهلًا بك في {escape(BOT_TITLE)}</b>\n\n"
         "بوت مخصص لطلاب <b>دفعة 27</b> لحساب معدل المرحلة الأولى ومساهمتها في التراكمي النهائي.\n\n"
         "⏳ <b>مدة التفعيل:</b>\n"
@@ -797,7 +796,6 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
         "للدعم وإعادة التفعيل:\n"
         "@KMC27bot\n\n"
         "بالتوفيق للجميع 🌿\n"
-    
     )
     await update.effective_message.reply_text(text, parse_mode=ParseMode.HTML, reply_markup=main_keyboard_for(update))
     return MAIN
