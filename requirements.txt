@@ -1,6 +1,6 @@
 python-telegram-bot==22.8
-Pillow==10.4.0
-weasyprint==62.3
-reportlab==4.2.2
+reportlab==4.2.5
 arabic-reshaper==3.0.0
 python-bidi==0.6.0
+Pillow==10.4.0
+matplotlib==3.9.2

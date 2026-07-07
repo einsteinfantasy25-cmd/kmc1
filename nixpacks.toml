@@ -1,14 +1,2 @@
 [phases.setup]
-nixPkgs = [
-  "python312",
-  "gcc",
-  "fontconfig",
-  "pango",
-  "cairo",
-  "glib",
-  "gdk-pixbuf",
-  "dejavu_fonts",
-  "noto-fonts",
-  "noto-fonts-extra",
-  "noto-fonts-emoji"
-]
+nixPkgs = ["python312", "gcc", "fontconfig", "dejavu_fonts"]

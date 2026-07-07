@@ -4,8 +4,6 @@ import glob
 import os
 import re
 import sqlite3
-import shutil
-import subprocess
 import tempfile
 import zipfile
 import base64
@@ -21,11 +19,6 @@ from typing import Dict, List, Optional, Set, Tuple
 from telegram import BotCommand, ReplyKeyboardMarkup, ReplyKeyboardRemove, Update
 from telegram.constants import ChatAction, ParseMode
 from telegram.error import Forbidden, TelegramError
-try:
-    from weasyprint import HTML as WeasyHTML
-except Exception:
-    WeasyHTML = None
-
 from telegram.ext import (
     Application,
     CommandHandler,
@@ -111,13 +104,13 @@ GRADES: Dict[str, Tuple[str, int, int]] = {
     "متوسط": ("Fair", 60, 69),
     "مقبول": ("Pass", 50, 59),
     "ضعيف": ("Weak", 0, 49),
-    "راسب": ("Weak", 0, 49),  # old alias, accepted if typed manually
+    "راسب": ("Weak", 0, 49),  # alias only, not shown to students
 }
 
 MAIN_ROWS = [
     ["🧮 حساب المعدل", "📝 إضافة/تغيير الاسم"],
-    ["📚 عرض المواد", "ℹ️ المساعدة"],
-    ["🔄 إعادة البداية"],
+    ["📚 عرض المواد", "📌 عن البوت"],
+    ["ℹ️ المساعدة", "🔄 إعادة البداية"],
 ]
 
 ADMIN_KEYBOARD = ReplyKeyboardMarkup(
@@ -443,8 +436,8 @@ def build_reports_zip_24h() -> Optional[str]:
 
 
 # -------------------------- HTML REPORT --------------------------
-# HTML template rendered by Chromium and exported to PDF.
-# Browser rendering handles Arabic names and A4 layout more reliably than manual PDF drawing.
+# Alternative reporting method: send a clean HTML report file instead of generating a PDF/image.
+# Browsers render Arabic names correctly, so this avoids font/rendering problems on Railway.
 
 HTML_NAVY = "#0D1F44"
 HTML_BLUE = "#2F5DA8"
@@ -484,21 +477,6 @@ def build_html_subject_rows(answers: List[dict], mode: str) -> str:
     return "\n".join(rows)
 
 
-
-def final_grade_label(avg: float) -> tuple[str, str]:
-    """Return Arabic/English grade label for a stage average."""
-    if avg >= 90:
-        return "امتياز", "Excellent"
-    if avg >= 80:
-        return "جيد جدًا", "Very Good"
-    if avg >= 70:
-        return "جيد", "Good"
-    if avg >= 60:
-        return "متوسط", "Fair"
-    if avg >= 50:
-        return "مقبول", "Pass"
-    return "ضعيف", "Weak"
-
 def create_html_report(student_name: str, answers: List[dict], result: dict, mode: str, update: Update) -> Tuple[str, str]:
     user = update.effective_user
     telegram_id = str(user.id) if user else "unknown"
@@ -506,29 +484,30 @@ def create_html_report(student_name: str, answers: List[dict], result: dict, mod
     storage_filename = f"{safe_filename(student_name)}_{iraq_now().strftime('%Y%m%d_%H%M%S')}_{telegram_id}.html"
     path = os.path.join(REPORTS_DIR, storage_filename)
 
-    report_date = iraq_now().strftime("%Y-%m-%d | %H:%M Iraq")
+    report_date = iraq_now().strftime("%Y-%m-%d %H:%M Iraq")
     logo_uri = logo_data_uri()
     logo_html = f'<img class="logo" src="{logo_uri}" alt="Batch 27 Logo">' if logo_uri else ""
 
     if mode == "grades":
-        stage_avg_display = f"{result['min_avg']:.2f}% - {result['max_avg']:.2f}%"
-        impact_display = f"{result['min_contribution']:.2f}% - {result['max_contribution']:.2f}%"
-        middle_display = f"Middle: {result['avg_avg']:.2f}%"
-        grade_ar, grade_en = final_grade_label(result['avg_avg'])
-        grade_display = f"{grade_ar} / {grade_en}"
+        result_cells = f"""
+        <tr><th>Metric</th><th>Minimum</th><th>Middle</th><th>Maximum</th></tr>
+        <tr><td>Stage average</td><td>{result['min_avg']:.2f}%</td><td>{result['avg_avg']:.2f}%</td><td>{result['max_avg']:.2f}%</td></tr>
+        <tr><td>Cumulative impact</td><td>{result['min_contribution']:.2f}%</td><td>{result['avg_contribution']:.2f}%</td><td>{result['max_contribution']:.2f}%</td></tr>
+        """
         subject_headers = "<tr><th>Subject</th><th>Cr</th><th>Grade</th><th>Range</th><th>Impact</th></tr>"
-        note = "The grade-based result gives a range. Impact is shown as a percentage of the final cumulative grade."
+        note = "Grade categories give a range. Stage 1 impact is shown as percent of the final cumulative grade."
     else:
-        stage_avg_display = f"{result['avg']:.2f}%"
-        impact_display = f"{result['contribution']:.2f}%"
-        middle_display = "Numeric score"
-        grade_ar, grade_en = final_grade_label(result['avg'])
-        grade_display = f"{grade_ar} / {grade_en}"
+        result_cells = f"""
+        <tr><th>Metric</th><th>Result</th></tr>
+        <tr><td>Stage average</td><td>{result['avg']:.2f}%</td></tr>
+        <tr><td>Cumulative impact</td><td>{result['contribution']:.2f}%</td></tr>
+        """
         subject_headers = "<tr><th>Subject</th><th>Cr</th><th>Score</th><th>Impact</th></tr>"
-        note = "Numeric scores were used. Impact is shown as a percentage of the final cumulative grade."
+        note = "Numeric scores were used. Stage 1 impact is shown as percent of the final cumulative grade."
 
     rows_html = build_html_subject_rows(answers, mode)
     student_name_html = html_escape_text(student_name)
+    result_cells = result_cells.strip()
 
     html = f"""<!doctype html>
 <html lang="en">
@@ -537,82 +516,55 @@ def create_html_report(student_name: str, answers: List[dict], result: dict, mod
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>KMC B27 Grade Report - {student_name_html}</title>
 <style>
-  :root {{ --navy:{HTML_NAVY}; --blue:{HTML_BLUE}; --soft:{HTML_SOFT}; --row:{HTML_ROW}; --line:{HTML_LINE}; --text:{HTML_TEXT}; --muted:{HTML_MUTED}; --accent:#EFF5FF; }}
-  * {{ box-sizing:border-box; }}
-  @page {{ size:A4; margin:6.5mm; }}
-  html, body {{ margin:0; padding:0; background:#fff; color:var(--text); font-family:"Noto Naskh Arabic", "Noto Sans Arabic", "DejaVu Sans", Tahoma, Arial, sans-serif; font-weight:700; }}
-  .page {{ width:100%; min-height:284mm; border:2px solid var(--navy); border-radius:10px; padding:7mm; position:relative; overflow:hidden; background:white; }}
-  .header {{ display:grid; grid-template-columns:1fr 110px; align-items:center; gap:12px; padding:3px 2px 9px; border-bottom:4px solid var(--blue); }}
-  h1 {{ margin:0; color:var(--navy); font-size:28px; line-height:1.04; letter-spacing:.2px; }}
-  .subtitle {{ margin-top:5px; color:var(--navy); font-size:13.5px; line-height:1.38; }}
-  .logo {{ max-width:108px; max-height:76px; object-fit:contain; justify-self:end; }}
-
-  .student-block {{ margin-top:9px; border:1px solid var(--line); border-radius:10px; overflow:hidden; }}
-  .student-row {{ display:grid; grid-template-columns:34mm 1fr; min-height:9.2mm; border-bottom:1px solid var(--line); }}
-  .student-row:last-child {{ border-bottom:none; }}
-  .student-label {{ background:var(--accent); color:var(--navy); padding:6px 9px; font-size:11.2px; display:flex; align-items:center; }}
-  .student-value {{ padding:6px 10px; color:var(--text); font-size:12.3px; display:flex; align-items:center; line-height:1.25; }}
-  .student-name {{ font-size:14px; direction:auto; unicode-bidi:plaintext; white-space:normal; overflow-wrap:anywhere; }}
-
-  .result-card {{ margin-top:10px; border:1px solid var(--line); border-radius:10px; overflow:hidden; }}
-  .result-title {{ background:var(--navy); color:white; padding:7px 10px; font-size:15px; display:flex; justify-content:space-between; align-items:center; gap:8px; }}
-  .result-title span {{ font-size:9.8px; color:#DFE9FF; line-height:1.2; text-align:right; }}
-  .result-grid {{ display:grid; grid-template-columns:1fr 1fr 1fr; }}
-  .metric {{ padding:8px 10px; border-right:1px solid var(--line); background:#FBFDFF; }}
-  .metric:last-child {{ border-right:none; }}
-  .metric .name {{ color:var(--muted); font-size:10px; margin-bottom:4px; }}
-  .metric .val {{ color:var(--navy); font-size:15px; line-height:1.25; }}
-  .metric .sub {{ color:var(--muted); font-size:8.5px; margin-top:2px; }}
-
-  .details-head {{ margin-top:10px; display:flex; justify-content:space-between; align-items:flex-end; gap:10px; }}
-  .details-title {{ margin:0; color:var(--navy); font-size:16px; line-height:1; }}
-  .details-note {{ margin:0; color:var(--muted); font-size:9px; text-align:right; }}
+  :root {{ --navy:{HTML_NAVY}; --blue:{HTML_BLUE}; --soft:{HTML_SOFT}; --row:{HTML_ROW}; --line:{HTML_LINE}; --text:{HTML_TEXT}; --muted:{HTML_MUTED}; }}
+  * {{ box-sizing: border-box; }}
+  body {{ margin:0; background:#eef2f7; color:var(--text); font-family: Tahoma, Arial, "Noto Naskh Arabic", "Noto Sans Arabic", sans-serif; font-weight:700; }}
+  .page {{ width:210mm; min-height:297mm; margin:18px auto; background:white; border:2px solid var(--navy); border-radius:8px; padding:10mm 9mm 8mm; position:relative; overflow:hidden; }}
+  .header {{ border:1.3px solid var(--line); border-radius:10px; padding:10px 14px 9px; display:grid; grid-template-columns:1fr 118px; align-items:center; gap:12px; border-bottom:5px solid var(--blue); }}
+  h1 {{ margin:0; color:var(--navy); font-size:28px; letter-spacing:.3px; line-height:1.05; }}
+  .subtitle {{ margin-top:6px; color:var(--navy); font-size:14.5px; line-height:1.35; }}
+  .logo {{ max-width:115px; max-height:78px; object-fit:contain; justify-self:end; }}
+  .info {{ margin-top:10px; border:1.3px solid var(--line); border-radius:10px; overflow:hidden; display:grid; grid-template-columns:1fr 1fr; }}
+  .info div {{ padding:9px 12px; border-bottom:1px solid var(--line); min-height:46px; }}
+  .info div:nth-child(odd) {{ border-right:1px solid var(--line); }}
+  .label {{ color:var(--muted); font-size:11.5px; display:block; margin-bottom:4px; }}
+  .value {{ color:var(--navy); font-size:15px; line-height:1.25; }}
+  .student-name {{ font-size:17px; direction:auto; unicode-bidi:plaintext; }}
+  .section-row {{ margin:12px 0 6px; display:flex; align-items:flex-end; justify-content:space-between; gap:10px; }}
+  .section-title {{ margin:0; color:var(--navy); font-size:20px; }}
+  .note {{ margin:0; color:var(--muted); font-size:10.5px; line-height:1.35; text-align:right; max-width:72%; }}
   table {{ width:100%; border-collapse:collapse; table-layout:fixed; }}
-  th {{ background:var(--navy); color:white; padding:5.4px 5px; font-size:10.2px; text-align:center; }}
-  td {{ padding:4.35px 5px; border:1px solid white; font-size:9.55px; text-align:center; line-height:1.12; }}
+  th {{ background:var(--navy); color:white; padding:7px 6px; font-size:11px; text-align:center; line-height:1.1; }}
+  td {{ padding:6px 6px; border:1px solid white; font-size:11px; text-align:center; line-height:1.15; }}
   td:first-child, th:first-child {{ text-align:left; }}
   tbody tr:nth-child(even) td {{ background:var(--row); }}
-  tbody tr:nth-child(odd) td {{ background:#FBFDFF; }}
-  .details-table {{ margin-top:6px; }}
-  .details-table th:nth-child(1) {{ width:42%; }} .details-table th:nth-child(2) {{ width:7%; }} .details-table th:nth-child(3) {{ width:18%; }} .details-table th:nth-child(4) {{ width:14%; }} .details-table th:nth-child(5) {{ width:19%; }}
-  .important-note {{ margin-top:7px; border:1px solid var(--line); background:#F7FAFF; border-radius:8px; padding:5px 8px; color:var(--muted); font-size:8.6px; line-height:1.23; }}
-  .footer {{ position:absolute; left:7mm; right:7mm; bottom:4mm; color:var(--muted); font-size:8.3px; text-align:center; }}
+  tbody tr:nth-child(odd) td {{ background:#fbfdff; }}
+  .result-table td {{ font-size:13px; padding:8px 6px; }}
+  .result-table td:first-child {{ color:var(--navy); }}
+  .details-title {{ margin:12px 0 6px; color:var(--navy); font-size:16px; }}
+  .details-table th:nth-child(1) {{ width:39%; }} .details-table th:nth-child(2) {{ width:7%; }} .details-table th:nth-child(3) {{ width:17%; }} .details-table th:nth-child(4) {{ width:17%; }} .details-table th:nth-child(5) {{ width:20%; }}
+  .details-table td {{ font-size:10.2px; padding:6px 5px; }}
+  .footer {{ position:absolute; left:9mm; right:9mm; bottom:5.5mm; color:var(--muted); font-size:9.5px; text-align:center; border-top:1px solid var(--line); padding-top:6px; }}
   .print-button {{ position:fixed; right:18px; bottom:18px; background:var(--navy); color:white; padding:12px 16px; border-radius:999px; text-decoration:none; font:700 14px Arial; box-shadow:0 6px 22px rgba(0,0,0,.20); }}
-  @media screen {{ body {{ background:#eef2f7; }} .page {{ width:210mm; margin:18px auto; background:#fff; }} }}
-  @media print {{ .print-button {{ display:none; }} }}
+  @media print {{ body {{ background:white; }} .page {{ margin:0; border-radius:0; box-shadow:none; }} .print-button {{ display:none; }} }}
+  @page {{ size:A4; margin:0; }}
 </style>
 </head>
 <body>
 <a class="print-button" href="javascript:window.print()">Print / Save PDF</a>
 <section class="page">
-  <div class="header">
-    <div>
-      <h1>KMC B27 GRADE CALCULATOR</h1>
-      <div class="subtitle">Stage 1 Grade Report | Al-Kindy College of Medicine<br>Batch 27 | Developed by Osama</div>
-    </div>
-    {logo_html}
+  <div class="header"><div><h1>KMC B27 GRADE CALCULATOR</h1><div class="subtitle">Stage 1 Grade Report | Al-Kindy College of Medicine<br>Batch 27 | Developed by Osama</div></div>{logo_html}</div>
+  <div class="info">
+    <div><span class="label">Student Name</span><span class="value student-name"><bdi dir="auto">{student_name_html}</bdi></span></div>
+    <div><span class="label">Report Date</span><span class="value">{report_date}</span></div>
+    <div><span class="label">Stage</span><span class="value">First Year</span></div>
+    <div><span class="label">College</span><span class="value">Al-Kindy Medicine</span></div>
   </div>
-
-  <div class="student-block">
-    <div class="student-row"><div class="student-label">Student Name</div><div class="student-value student-name"><bdi dir="auto">{student_name_html}</bdi></div></div>
-    <div class="student-row"><div class="student-label">Report Date</div><div class="student-value">{report_date}</div></div>
-    <div class="student-row"><div class="student-label">Stage</div><div class="student-value">First Year</div></div>
-    <div class="student-row"><div class="student-label">College</div><div class="student-value">Al-Kindy College of Medicine</div></div>
-  </div>
-
-  <div class="result-card">
-    <div class="result-title">Final Grade Summary <span>{html_escape_text(note)}</span></div>
-    <div class="result-grid">
-      <div class="metric"><div class="name">Stage Average</div><div class="val">{stage_avg_display}</div><div class="sub">{middle_display}</div></div>
-      <div class="metric"><div class="name">General Grade</div><div class="val"><bdi dir="auto">{html_escape_text(grade_display)}</bdi></div><div class="sub">based on average/middle</div></div>
-      <div class="metric"><div class="name">Cumulative Impact</div><div class="val">{impact_display}</div><div class="sub">percent of final cumulative grade</div></div>
-    </div>
-  </div>
-
-  <div class="details-head"><h2 class="details-title">Subject Details</h2><p class="details-note">Credits-based calculation for the 15 Stage 1 subjects.</p></div>
+  <div class="section-row"><h2 class="section-title">Final Result</h2><p class="note">{html_escape_text(note)}</p></div>
+  <table class="result-table"><tbody>{result_cells}</tbody></table>
+  <h2 class="details-title">Subject Details</h2>
   <table class="details-table"><thead>{subject_headers}</thead><tbody>{rows_html}</tbody></table>
-  <div class="important-note"><strong>Important note:</strong> Cumulative impact is displayed as a percentage of the final cumulative grade, not as a division by 5. This report is for estimation only.</div>
-  <div class="footer">This report is automatically generated and is not an official college transcript. Developed by Osama | Iraq time</div>
+  <div class="footer">Cumulative impact is a percentage of the final cumulative grade, not a division by 5. This report is automatically generated and is not an official college transcript.<br>Developed by Osama | Iraq time</div>
 </section>
 </body>
 </html>"""
@@ -620,40 +572,7 @@ def create_html_report(student_name: str, answers: List[dict], result: dict, mod
         f.write(html)
     return path, send_filename
 
-
-
-# -------------------------- PDF conversion --------------------------
-# Stable method: render the HTML report with WeasyPrint/Pango, then output PDF.
-# This method handles Arabic names and A4 CSS layout better than manual ReportLab/PIL drawing.
-
-
-def convert_html_to_pdf_with_weasyprint(html_path: str, pdf_path: str) -> bool:
-    if WeasyHTML is None:
-        logger.error("WeasyPrint is not installed. Cannot generate PDF.")
-        return False
-    try:
-        WeasyHTML(filename=html_path, base_url=os.path.dirname(os.path.abspath(html_path))).write_pdf(pdf_path)
-        return os.path.exists(pdf_path) and os.path.getsize(pdf_path) > 0
-    except Exception as exc:
-        logger.exception("WeasyPrint PDF conversion exception: %s", exc)
-        return False
-
-
-def create_pdf_report(student_name: str, answers: List[dict], result: dict, mode: str, update: Update) -> Tuple[str, str, bool]:
-    """Create an Arabic-safe A4 PDF report using HTML/CSS rendering.
-
-    Returns: (path_to_send, filename_to_send, is_pdf)
-    If PDF conversion fails, falls back to the HTML file instead of crashing the bot.
-    """
-    html_path, _html_filename = create_html_report(student_name, answers, result, mode, update)
-    base_name = safe_filename(student_name)
-    telegram_id = str(update.effective_user.id) if update.effective_user else "unknown"
-    pdf_storage = os.path.join(REPORTS_DIR, f"{base_name}_{iraq_now().strftime('%Y%m%d_%H%M%S')}_{telegram_id}.pdf")
-    pdf_send_name = f"{base_name}.pdf"
-    if convert_html_to_pdf_with_weasyprint(html_path, pdf_storage):
-        return pdf_storage, pdf_send_name, True
-    return html_path, f"{base_name}.html", False
-
+# -------------------------- Telegram handlers --------------------------
 # -------------------------- Telegram handlers --------------------------
 
 async def post_init(application: Application) -> None:
@@ -663,6 +582,7 @@ async def post_init(application: Application) -> None:
         BotCommand("rename", "إضافة أو تغيير الاسم"),
         BotCommand("list", "عرض المواد"),
         BotCommand("help", "شرح طريقة الحساب"),
+        BotCommand("about", "عن البوت"),
         BotCommand("reset", "إعادة البداية"),
         BotCommand("myid", "معرفة رقم حسابك"),
         BotCommand("admin", "لوحة الأدمن"),
@@ -695,7 +615,22 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> in
         "معدل المرحلة = مجموع (درجة المادة × الكردت) ÷ 36\n"
         "مساهمة المرحلة بالتراكمي النهائي = معدل المرحلة × 0.05\n"
         "وتظهر كنسبة من الدرجة النهائية الكلية، مثال: 4.25% وليس 4.25/5.\n\n"
-        "<b>بعد إكمال الحساب، يرسل البوت تقرير PDF باسم الطالب.</b>"
+        "<b>بعد إكمال الحساب، يرسل البوت تقرير HTML باسم الطالب.</b>"
+    )
+    await update.effective_message.reply_text(text, parse_mode=ParseMode.HTML, reply_markup=main_keyboard_for(update))
+    return MAIN
+
+
+async def about_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    upsert_user(update, context)
+    text = (
+        "<b>📌 عن البوت</b>\n\n"
+        "هذا البوت يحسب <b>معدل المرحلة الأولى</b> لطلاب <b>كلية طب الكندي - Batch 27</b> حسب الكردتات.\n\n"
+        "<b>ماذا يفعل؟</b>\n"
+        "• يحسب المعدل بالتقديرات أو بالدرجات الرقمية.\n"
+        "• يوضح تأثير المرحلة الأولى في التراكمي النهائي كنسبة مئوية.\n"
+        "• يرسل تقريرًا مرتبًا باسم الطالب بدون إظهار معلومات Telegram داخل التقرير.\n\n"
+        "<b>Developer:</b> Osama"
     )
     await update.effective_message.reply_text(text, parse_mode=ParseMode.HTML, reply_markup=main_keyboard_for(update))
     return MAIN
@@ -750,7 +685,7 @@ async def begin_calculation(update: Update, context: ContextTypes.DEFAULT_TYPE) 
     clear_calc(context)
     if not context.user_data.get("student_name"):
         await update.effective_message.reply_text(
-            "<b>قبل الحساب، يجب إضافة اسم الطالب الثلاثي حتى يظهر داخل تقرير PDF.</b>",
+            "<b>قبل الحساب، يجب إضافة اسم الطالب الثلاثي حتى يظهر داخل تقرير HTML.</b>",
             parse_mode=ParseMode.HTML,
             reply_markup=ReplyKeyboardRemove(),
         )
@@ -882,14 +817,14 @@ def build_summary_text(result: dict, mode: str) -> str:
             f"<b>المعدل الوسطي التقريبي:</b> {result['avg_avg']:.2f}%\n"
             f"<b>مساهمة المرحلة الأولى في التراكمي النهائي:</b> {result['min_contribution']:.2f}% - {result['max_contribution']:.2f}%\n"
             "<b>ملاحظة:</b> هذه النسبة من الدرجة النهائية الكلية، وليست قسمة على 5.\n\n"
-            "<b>تم إرسال تقرير PDF باسمك.</b>"
+            "<b>تم إرسال تقرير HTML باسمك.</b>"
         )
     return (
         "<b>✅ تم حساب نتيجتك حسب الدرجات الرقمية</b>\n\n"
         f"<b>معدل المرحلة الأولى:</b> {result['avg']:.2f}%\n"
         f"<b>مساهمة المرحلة الأولى في التراكمي النهائي:</b> {result['contribution']:.2f}%\n"
         "<b>ملاحظة:</b> هذه النسبة من الدرجة النهائية الكلية، وليست قسمة على 5.\n\n"
-        "<b>تم إرسال تقرير PDF باسمك.</b>"
+        "<b>تم إرسال تقرير HTML باسمك.</b>"
     )
 
 
@@ -898,15 +833,14 @@ async def finish_calculation(update: Update, context: ContextTypes.DEFAULT_TYPE)
     mode = context.user_data["mode"]
     student_name = context.user_data.get("student_name", "student")
     result = calculate_result(answers, mode)
-    report_path, send_filename, is_pdf = create_pdf_report(student_name, answers, result, mode, update)
+    report_path, send_filename = create_html_report(student_name, answers, result, mode, update)
     increment_calculation(update)
     record_report(update, student_name, report_path, send_filename, mode, result)
 
     summary = build_summary_text(result, mode)
     await update.message.reply_text(summary, parse_mode=ParseMode.HTML, reply_markup=main_keyboard_for(update))
-    caption = "<b>تقريرك جاهز بصيغة PDF ✅</b>" if is_pdf else "<b>تعذر إنشاء PDF على السيرفر، تم إرسال تقرير HTML احتياطيًا ✅</b>"
     with open(report_path, "rb") as f:
-        await update.message.reply_document(document=f, filename=send_filename, caption=caption, parse_mode=ParseMode.HTML)
+        await update.message.reply_document(document=f, filename=send_filename, caption="<b>تقريرك جاهز كملف HTML ✅</b>\nافتح الملف من الهاتف. إذا أردته PDF اضغط Print / Save PDF داخل الملف.", parse_mode=ParseMode.HTML)
     clear_calc(context)
     return MAIN
 
@@ -1042,6 +976,8 @@ async def main_menu_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) 
         return await ask_name(update, context)
     if text == "📚 عرض المواد":
         return await list_command(update, context)
+    if text == "📌 عن البوت":
+        return await about_command(update, context)
     if text == "ℹ️ المساعدة":
         return await help_command(update, context)
     if text == "🔄 إعادة البداية":
@@ -1073,6 +1009,7 @@ def main() -> None:
 
     application.add_handler(CommandHandler("myid", myid_command))
     application.add_handler(CommandHandler("admin", admin_panel))
+    application.add_handler(CommandHandler("about", about_command))
 
     conv = ConversationHandler(
         entry_points=[CommandHandler("start", start), CommandHandler("calculate", begin_calculation), CommandHandler("rename", ask_name)],
@@ -1085,6 +1022,7 @@ def main() -> None:
         fallbacks=[
             CommandHandler("reset", reset_command),
             CommandHandler("help", help_command),
+            CommandHandler("about", about_command),
             CommandHandler("list", list_command),
             CommandHandler("start", start),
             CommandHandler("myid", myid_command),
@@ -1096,6 +1034,7 @@ def main() -> None:
 
     application.add_handler(conv)
     application.add_handler(CommandHandler("help", help_command))
+    application.add_handler(CommandHandler("about", about_command))
     application.add_handler(CommandHandler("list", list_command))
     application.add_handler(CommandHandler("reset", reset_command))
     logger.info("KMC B27 Grade Calculator Bot is running...")
