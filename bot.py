@@ -1,4 +1,3 @@
-from keep_alive import start_health_server
 import csv
 import logging
 import glob
@@ -8,6 +7,7 @@ import sqlite3
 import tempfile
 import zipfile
 import base64
+from keep_alive import start_health_server
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 try:
@@ -1430,7 +1430,7 @@ def main() -> None:
     application.add_handler(CommandHandler("list", list_command))
     application.add_handler(CommandHandler("reset", reset_command))
     logger.info("KMC B27 Grade Calculator Bot is running...")
-   start_health_server(allowed_updates=Update.ALL_TYPES)
+   start_health_server()
     application.run_polling(allowed_updates=Update.ALL_TYPES)
 
 
