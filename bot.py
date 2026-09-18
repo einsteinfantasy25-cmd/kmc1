@@ -1430,7 +1430,7 @@ def main() -> None:
     application.add_handler(CommandHandler("list", list_command))
     application.add_handler(CommandHandler("reset", reset_command))
     logger.info("KMC B27 Grade Calculator Bot is running...")
-   start_health_server()
+   start_health_server(allowed_updates=Update.ALL_TYPES)
     application.run_polling(allowed_updates=Update.ALL_TYPES)
 
 
