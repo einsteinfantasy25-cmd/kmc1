@@ -962,9 +962,9 @@ def compute_cumulative_range(
 # Keyboards / session helpers
 # ---------------------------------------------------------------------------
 MAIN_ROWS = [
-    ["🧮 حساب المعدل", "📈 حساب التراكمي"],
-    ["📝 إضافة/تغيير الاسم", "📚 عرض المواد"],
-    ["ℹ️ المساعدة", "🔄 إعادة البداية"],
+    [" حساب المعدل", " حساب التراكمي"],
+    [" إضافة/تغيير الاسم", "📚 عرض المواد"],
+    [ "🔄 إعادة البداية"],
 ]
 
 
@@ -1047,8 +1047,8 @@ def is_user_banned(user_id: Optional[int]) -> bool:
 
 def banned_message() -> str:
     return (
-        "<b>🚫 الوصول إلى البوت موقوف لهذا الحساب.</b>\n\n"
-        "إذا كنت تعتقد أن هذا حصل بالخطأ، تواصل مع إدارة البوت لإعادة التفعيل."
+        "<b>🚫 تم حضرك لعدم امثال اوامر البوت والوصول إلى البوت موقوف لهذا الحساب.</b>\n\n"
+        "إذا كنت تعتقد أن هذا حصل بالخطأ، تواصل مع إدارة البوت لإعادة@KMC27BOT التفعيل."
     )
 
 
@@ -1276,10 +1276,7 @@ async def post_init(application: Application) -> None:
     commands = [
         BotCommand("start", "بدء استخدام البوت"),
         BotCommand("calculate", "حساب معدل مرحلة"),
-        BotCommand("cumulative", "حساب التراكمي"),
-        BotCommand("list", "عرض مواد المراحل"),
         BotCommand("help", "شرح طريقة الحساب"),
-        BotCommand("about", "عن البوت"),
         BotCommand("reset", "إعادة البداية"),
     ]
     await application.bot.set_my_commands(commands)
@@ -1292,8 +1289,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     text = (
         f"<b>👋 أهلًا بك في {escape(BOT_TITLE)}</b>\n\n"
         "حاسبة درجات ومعدلات لطلاب كلية طب الكندي، من المرحلة الأولى إلى السادسة.\n\n"
-        "• المرحلة الأولى محفوظة بنفس مواد وكردتات النسخة الأصلية.\n"
-        "• المراحل الثانية إلى السادسة محسوبة حسب الكردتات المضافة للنظام.\n"
+        "• المراحل الاولى إلى السادسة محسوبة حسب الكردتات 2026 المضافة للنظام.\n"
         "• يدعم حساب معدل المرحلة والتراكمي حتى المرحلة الحالية.\n\n"
         "اختر من القائمة بالأسفل."
     )
@@ -1392,7 +1388,7 @@ async def begin_calculation(update: Update, context: ContextTypes.DEFAULT_TYPE) 
     clear_calc(context)
     if not context.user_data.get("student_name"):
         await update.effective_message.reply_text(
-            "<b>قبل الحساب، أضف اسم الطالب حتى يظهر داخل التقرير.</b>",
+            "<b> قبل الحساب، أضف اسم الطالب في زر الاسم حتى يظهر داخل التقرير.</b>",
             parse_mode=ParseMode.HTML,
             reply_markup=main_keyboard_for(update),
         )
@@ -1637,7 +1633,7 @@ async def begin_cumulative(update: Update, context: ContextTypes.DEFAULT_TYPE) -
         return MAIN
     clear_calc(context)
     await update.effective_message.reply_text(
-        "<b>📈 اختر أعلى مرحلة تريد حساب التراكمي حتى نهايتها:</b>",
+        "<b> اختر أعلى مرحلة تريد حساب التراكمي حتى نهايتها:</b>",
         parse_mode=ParseMode.HTML,
         reply_markup=stage_keyboard(include_stage1=False),
     )
@@ -1704,7 +1700,7 @@ async def prepare_cumulative(
         used = sorted(values.keys())
         note = ""
         if used:
-            note = "\n\n✅ سأستخدم النتائج الرقمية المحفوظة للمراحل: " + ", ".join(str(x) for x in used)
+            note = "\n\n سأستخدم النتائج الرقمية المحفوظة للمراحل: " + ", ".join(str(x) for x in used)
         stage_no = needed[0]
         await update.effective_message.reply_text(
             f"<b>أدخل المعدل السنوي الرسمي للمرحلة {stage_no}</b> من 0 إلى 100.{note}",
@@ -1764,7 +1760,7 @@ async def finalize_cumulative(update: Update, context: ContextTypes.DEFAULT_TYPE
         max_v = d(context.user_data["cum_range_max"])
         result = compute_cumulative_range(values, target, range_stage, min_v, max_v)
         text = (
-            f"<b>📈 التراكمي حتى {escape(STAGES[target].ar_name)}</b>\n\n"
+            f"<b> التراكمي حتى {escape(STAGES[target].ar_name)}</b>\n\n"
             f"<b>المعدل التراكمي الحالي التقريبي:</b> {fmt(result['current_min'])}% - {fmt(result['current_max'])}%\n"
             f"<b>المساهمة المحققة في معدل التخرج:</b> {fmt(result['final_min'])}% - {fmt(result['final_max'])}%\n"
             f"<b>الوزن المنجز:</b> {fmt_credit(result['completed_weight'])}%\n\n"
@@ -1783,7 +1779,7 @@ async def finalize_cumulative(update: Update, context: ContextTypes.DEFAULT_TYPE
     else:
         result = compute_cumulative_exact(values, target)
         text = (
-            f"<b>📈 التراكمي حتى {escape(STAGES[target].ar_name)}</b>\n\n"
+            f"<b> التراكمي حتى {escape(STAGES[target].ar_name)}</b>\n\n"
             f"<b>المعدل التراكمي الحالي:</b> {fmt(result['current_cumulative'])}%\n"
             f"<b>المساهمة المحققة في معدل التخرج النهائي:</b> {fmt(result['final_contribution'])}% من 100\n"
             f"<b>الوزن المنجز:</b> {fmt_credit(result['completed_weight'])}%\n"
@@ -1808,7 +1804,7 @@ async def list_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> in
     if await deny_if_unavailable(update, context):
         return MAIN
     await update.effective_message.reply_text(
-        "<b>📚 اختر المرحلة لعرض المواد والكردتات:</b>",
+        "<b> اختر المرحلة لعرض المواد والكردتات:</b>",
         parse_mode=ParseMode.HTML,
         reply_markup=stage_keyboard(),
     )
